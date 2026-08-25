@@ -82,20 +82,14 @@ def extrair_contencioso():
     usuario = env("IILEX_USERNAME")
     senha = env("IILEX_PASSWORD")
 
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        status=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-
     session = requests.Session()
     session.auth = (usuario, senha)
-    session.headers.update({"Accept": "application/json"})
-    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }
+    )
 
     registros_totais = []
     pagina = 0
@@ -111,16 +105,39 @@ def extrair_contencioso():
             timeout=60,
         )
 
+        if resposta.status_code in (403, 404):
+            try:
+                dados_erro = resposta.json()
+                mensagem = str(
+                    dados_erro
+                    .get("erro", {})
+                    .get("mensagem", "")
+                )
+            except Exception:
+                mensagem = ""
+
+            if "Nenhum registro" in mensagem:
+                break
+
+            if resposta.status_code == 403:
+                time.sleep(30)
+                continue
+
+            resposta.raise_for_status()
+
+        if resposta.status_code == 429:
+            time.sleep(65)
+            continue
+
         resposta.raise_for_status()
 
         dados = resposta.json()
 
-        if "registros" not in dados:
-            raise RuntimeError(
-                f"Resposta inesperada do IILEX na página {pagina}"
-            )
-
-        registros = dados.get("registros", {}).get("registro", [])
+        registros = (
+            dados
+            .get("registros", {})
+            .get("registro", [])
+        )
 
         if not registros:
             break
@@ -129,10 +146,14 @@ def extrair_contencioso():
             registros = [registros]
 
         registros_totais.extend(registros)
+
         pagina += 1
+        time.sleep(0.2)
 
     if not registros_totais:
-        raise RuntimeError("Nenhum registro retornado pelo Contencioso do IILEX")
+        raise RuntimeError(
+            "Nenhum registro retornado pelo Contencioso do IILEX"
+        )
 
     return registros_totais
 
