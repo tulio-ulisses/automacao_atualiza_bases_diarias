@@ -15,7 +15,7 @@ BASE_URL = "https://juscash.iilex.com.br/sistema"
 MODULO = 1
 TABELA = "contencioso"
 
-LINHAS_POR_PAGINA = 100
+LINHAS_POR_PAGINA = 50
 LOTE_SUPABASE = 500
 
 
@@ -148,7 +148,7 @@ def extrair_contencioso():
         registros_totais.extend(registros)
 
         pagina += 1
-        time.sleep(0.2)
+        time.sleep(0.5)
 
     if not registros_totais:
         raise RuntimeError(
