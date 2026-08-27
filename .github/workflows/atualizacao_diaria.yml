@@ -1,10 +1,10 @@
-name: Atualização diária das bases
+﻿name: AtualizaÃ§Ã£o diÃ¡ria das bases
 
 on:
   workflow_dispatch:
 
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "17 2 * * *"
       timezone: "America/Sao_Paulo"
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
     steps:
-      - name: Baixar repositório
+      - name: Baixar repositÃ³rio
         uses: actions/checkout@v4
 
       - name: Configurar Python
@@ -29,7 +29,7 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Instalar dependências
+      - name: Instalar dependÃªncias
         run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: I - Contencioso
@@ -38,8 +38,9 @@ jobs:
       - name: II - LOY
         run: python II_loy.py
 
-      - name: III - Histórico
+      - name: III - HistÃ³rico
         run: python III_historico.py
 
       - name: IIII - Agenda
         run: python IIII_agenda.py
+

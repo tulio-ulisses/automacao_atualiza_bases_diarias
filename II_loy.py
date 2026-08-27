@@ -7,29 +7,31 @@ import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 from supabase import create_client
 
 
-IILEX_BASE_URL = "https://juscash.iilex.com.br/sistema"
 LOY_BASE_URL = "https://api.loylegal.com/v1"
 LOY_INTERMEDIARIAS_URL = "https://web.2adv.com.br/api"
 
 DATABASE_LOY = "20616170000102"
-MODULO_CONTENCIOSO = 1
-TABELA = "peticoes_loy"
 
-IILEX_LINHAS_POR_PAGINA = 50
-IILEX_INTERVALO = 0.5
-IILEX_MAX_TENTATIVAS = 5
+TABELA_CONTENCIOSO = "contencioso"
+TABELA_LOY = "peticoes_loy"
 
-LOY_MAX_WORKERS = 5
+LOY_MAX_WORKERS = 8
 LOY_INTERVALO = 0.25
 LOY_MAX_TENTATIVAS = 5
 
-LOTE_SUPABASE = 500
+LOTE_LEITURA_SUPABASE = 1000
+LOTE_ESCRITA_SUPABASE = 500
+
+FUSO_BRASILIA = ZoneInfo(
+    "America/Sao_Paulo"
+)
 
 
 def env(nome):
@@ -45,10 +47,13 @@ def env(nome):
 
 def normalizar_nome(nome):
     nome = str(nome)
+
     nome = unicodedata.normalize(
-        "NFKD", nome
+        "NFKD",
+        nome,
     ).encode(
-        "ASCII", "ignore"
+        "ASCII",
+        "ignore",
     ).decode()
 
     nome = re.sub(
@@ -86,10 +91,15 @@ def normalizar_colunas(colunas):
 
         usadas[base] += 1
 
-        sufixo = f"_{usadas[base]}"
+        sufixo = (
+            f"_{usadas[base]}"
+        )
 
         resultado.append(
-            base[:100 - len(sufixo)] + sufixo
+            base[
+                :100 - len(sufixo)
+            ]
+            + sufixo
         )
 
     return resultado
@@ -99,7 +109,10 @@ def preparar_valor(valor):
     if valor is None:
         return None
 
-    if isinstance(valor, (dict, list)):
+    if isinstance(
+        valor,
+        (dict, list),
+    ):
         return json.dumps(
             valor,
             ensure_ascii=False,
@@ -108,64 +121,40 @@ def preparar_valor(valor):
     try:
         if pd.isna(valor):
             return None
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         pass
 
     return str(valor)
 
 
-def normalizar_texto(texto):
-    texto = str(texto)
-
-    texto = unicodedata.normalize(
-        "NFKD",
-        texto,
-    ).encode(
-        "ASCII",
-        "ignore",
-    ).decode()
-
-    return texto.lower()
-
-
-def resposta_sem_registros(resposta):
-    textos = [resposta.text]
-
-    try:
-        textos.append(
-            json.dumps(
-                resposta.json(),
-                ensure_ascii=False,
-            )
+def chave_processo(numero):
+    return "".join(
+        filter(
+            str.isdigit,
+            str(numero),
         )
-    except Exception:
-        pass
-
-    texto = normalizar_texto(
-        " ".join(textos)
     )
 
-    return "nenhum registro" in texto
 
-
-IILEX_USERNAME = env("IILEX_USERNAME")
-IILEX_PASSWORD = env("IILEX_PASSWORD")
-LOY_TOKEN = env("LOY_TOKEN_SERVICOS")
-
-
-session_iilex = requests.Session()
-
-session_iilex.auth = (
-    IILEX_USERNAME,
-    IILEX_PASSWORD,
+SUPABASE_URL = env(
+    "SUPABASE_URL"
 )
 
-session_iilex.headers.update(
-    {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Connection": "keep-alive",
-    }
+SUPABASE_KEY = env(
+    "SUPABASE_SERVICE_ROLE_KEY"
+)
+
+LOY_TOKEN = env(
+    "LOY_TOKEN_SERVICOS"
+)
+
+
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
 )
 
 
@@ -176,20 +165,32 @@ loy_ultimo_request = 0.0
 
 
 def get_session_loy():
-    if not hasattr(thread_local, "session_loy"):
+    if not hasattr(
+        thread_local,
+        "session_loy",
+    ):
         session = requests.Session()
 
         session.headers.update(
             {
-                "Authorization": f"Bearer {LOY_TOKEN}",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0",
+                "Authorization":
+                    f"Bearer {LOY_TOKEN}",
+                "Accept":
+                    "application/json",
+                "User-Agent":
+                    "Mozilla/5.0",
+                "Connection":
+                    "keep-alive",
             }
         )
 
-        thread_local.session_loy = session
+        thread_local.session_loy = (
+            session
+        )
 
-    return thread_local.session_loy
+    return (
+        thread_local.session_loy
+    )
 
 
 def esperar_loy():
@@ -200,13 +201,20 @@ def esperar_loy():
 
         restante = (
             LOY_INTERVALO
-            - (agora - loy_ultimo_request)
+            - (
+                agora
+                - loy_ultimo_request
+            )
         )
 
         if restante > 0:
-            time.sleep(restante)
+            time.sleep(
+                restante
+            )
 
-        loy_ultimo_request = time.monotonic()
+        loy_ultimo_request = (
+            time.monotonic()
+        )
 
 
 def requisicao_loy(
@@ -222,61 +230,102 @@ def requisicao_loy(
         esperar_loy()
 
         try:
-            resposta = get_session_loy().get(
-                url,
-                timeout=timeout,
+            resposta = (
+                get_session_loy()
+                .get(
+                    url,
+                    timeout=timeout,
+                )
             )
 
-        except requests.exceptions.RequestException as erro:
+        except (
+            requests.exceptions
+            .RequestException
+        ) as erro:
             ultimo_erro = erro
 
-            if tentativa == LOY_MAX_TENTATIVAS:
+            if (
+                tentativa
+                == LOY_MAX_TENTATIVAS
+            ):
                 raise
 
+            espera = min(
+                60,
+                5
+                * 2
+                ** (
+                    tentativa - 1
+                ),
+            )
+
             time.sleep(
-                min(
-                    60,
-                    5 * 2 ** (tentativa - 1),
-                )
+                espera
             )
 
             continue
 
-        if resposta.status_code in (200, 404):
+        if resposta.status_code in (
+            200,
+            404,
+        ):
             return resposta
 
-        if resposta.status_code == 429:
-            espera = resposta.headers.get(
-                "Retry-After"
+        if (
+            resposta.status_code
+            == 429
+        ):
+            retry_after = (
+                resposta.headers
+                .get("Retry-After")
             )
 
             try:
-                espera = int(espera)
-            except (TypeError, ValueError):
+                espera = int(
+                    retry_after
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
                 espera = 60
 
             time.sleep(
-                max(espera, 30)
-            )
-
-            continue
-
-        if resposta.status_code >= 500:
-            time.sleep(
-                min(
-                    60,
-                    5 * 2 ** (tentativa - 1),
+                max(
+                    espera,
+                    30,
                 )
             )
 
             continue
 
-        if resposta.status_code in (401, 403):
+        if (
+            resposta.status_code
+            >= 500
+        ):
+            espera = min(
+                60,
+                5
+                * 2
+                ** (
+                    tentativa - 1
+                ),
+            )
+
+            time.sleep(
+                espera
+            )
+
+            continue
+
+        if resposta.status_code in (
+            401,
+            403,
+        ):
             raise RuntimeError(
                 f"LOY retornou HTTP "
                 f"{resposta.status_code}. "
-                f"A execução foi interrompida "
-                f"para evitar novas requisições."
+                f"Execução interrompida."
             )
 
         resposta.raise_for_status()
@@ -285,190 +334,176 @@ def requisicao_loy(
         raise ultimo_erro
 
     raise RuntimeError(
-        "Falha persistente na API LOY"
+        "Falha persistente "
+        "na API LOY"
     )
 
 
-def buscar_processos_iilex(
-    max_paginas=5000,
+def ler_tabela_supabase(
+    tabela,
+    colunas,
 ):
-    processos = []
+    registros = []
+    inicio = 0
 
-    pagina = 1
-    total_paginas = None
+    selecao = ",".join(
+        colunas
+    )
 
-    while pagina <= max_paginas:
+    while True:
+        fim = (
+            inicio
+            + LOTE_LEITURA_SUPABASE
+            - 1
+        )
 
-        resposta = None
-
-        for tentativa in range(
-            1,
-            IILEX_MAX_TENTATIVAS + 1,
-        ):
-            try:
-                resposta = session_iilex.get(
-                    f"{IILEX_BASE_URL}/api/public/v1/dados",
-                    params={
-                        "idmodulo": MODULO_CONTENCIOSO,
-                        "pagina": pagina,
-                        "linhas": IILEX_LINHAS_POR_PAGINA,
-                    },
-                    timeout=60,
-                )
-
-            except requests.exceptions.RequestException:
-                if tentativa == IILEX_MAX_TENTATIVAS:
-                    raise
-
-                time.sleep(
-                    min(
-                        60,
-                        5 * 2 ** (tentativa - 1),
-                    )
-                )
-
-                continue
-
-            if resposta.status_code == 200:
-                break
-
-            if resposta.status_code in (403, 404):
-
-                if resposta_sem_registros(
-                    resposta
-                ):
-                    return list(
-                        dict.fromkeys(processos)
-                    )
-
-                if resposta.status_code == 403:
-
-                    if tentativa == IILEX_MAX_TENTATIVAS:
-                        raise RuntimeError(
-                            f"IILEX retornou HTTP 403 "
-                            f"repetidamente na página "
-                            f"{pagina}"
-                        )
-
-                    time.sleep(30)
-                    continue
-
-                resposta.raise_for_status()
-
-            if resposta.status_code == 429:
-
-                if tentativa == IILEX_MAX_TENTATIVAS:
-                    resposta.raise_for_status()
-
-                time.sleep(65)
-                continue
-
-            if resposta.status_code >= 500:
-
-                if tentativa == IILEX_MAX_TENTATIVAS:
-                    resposta.raise_for_status()
-
-                time.sleep(
-                    min(
-                        60,
-                        5 * 2 ** (tentativa - 1),
-                    )
-                )
-
-                continue
-
-            resposta.raise_for_status()
-
-        if resposta is None:
-            raise RuntimeError(
-                f"Falha ao obter página {pagina}"
+        resposta = (
+            supabase
+            .table(tabela)
+            .select(selecao)
+            .range(
+                inicio,
+                fim,
             )
-
-        dados = resposta.json()
-
-        registros = (
-            dados
-            .get("registros", {})
-            .get("registro", [])
+            .execute()
         )
 
-        if not registros:
-            break
-
-        if not isinstance(
-            registros,
-            list,
-        ):
-            registros = [registros]
-
-        for item in registros:
-            processo = item.get("Processo")
-
-            if processo:
-                processos.append(processo)
-
-        paginacao = (
-            dados.get("paginacao", {})
-            or {}
+        lote = (
+            resposta.data
+            or []
         )
 
-        if total_paginas is None:
-            try:
-                total_paginas = int(
-                    paginacao.get(
-                        "total_de_paginas"
-                    )
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                total_paginas = None
+        registros.extend(
+            lote
+        )
 
         if (
-            total_paginas
-            and pagina >= total_paginas
+            len(lote)
+            < LOTE_LEITURA_SUPABASE
         ):
             break
 
-        pagina += 1
-        time.sleep(IILEX_INTERVALO)
+        inicio += (
+            LOTE_LEITURA_SUPABASE
+        )
+
+    return registros
+
+
+def buscar_processos_contencioso():
+    registros = (
+        ler_tabela_supabase(
+            TABELA_CONTENCIOSO,
+            ["processo"],
+        )
+    )
+
+    processos = []
+
+    vistos = set()
+
+    for registro in registros:
+        processo = registro.get(
+            "processo"
+        )
+
+        chave = chave_processo(
+            processo
+        )
+
+        if (
+            not chave
+            or chave in vistos
+        ):
+            continue
+
+        vistos.add(
+            chave
+        )
+
+        processos.append(
+            processo
+        )
 
     if not processos:
         raise RuntimeError(
-            "Nenhum processo retornado "
-            "pelo Contencioso do IILEX"
+            "Nenhum processo encontrado "
+            "na tabela contencioso."
         )
 
-    return list(
-        dict.fromkeys(processos)
-    )
+    return processos
+
+
+def carregar_cache_loy():
+    try:
+        registros = (
+            ler_tabela_supabase(
+                TABELA_LOY,
+                [
+                    "processo",
+                    "id_processo",
+                    "titulo",
+                    "situacao",
+                    "is_worked",
+                ],
+            )
+        )
+
+    except Exception:
+        return {}
+
+    cache = {}
+
+    for registro in registros:
+        processo = registro.get(
+            "processo"
+        )
+
+        chave = chave_processo(
+            processo
+        )
+
+        if chave:
+            cache[chave] = (
+                registro
+            )
+
+    return cache
 
 
 def buscar_capa_processo(
     numero_processo,
 ):
-    numero_limpo = "".join(
-        filter(
-            str.isalnum,
-            str(numero_processo),
+    numero_limpo = (
+        chave_processo(
+            numero_processo
         )
     )
+
+    if not numero_limpo:
+        return None
 
     resposta = requisicao_loy(
         f"{LOY_BASE_URL}/"
         f"{DATABASE_LOY}/"
-        f"process/{numero_limpo}",
+        f"process/"
+        f"{numero_limpo}",
         timeout=30,
     )
 
-    if resposta.status_code == 404:
+    if (
+        resposta.status_code
+        == 404
+    ):
         return None
 
     return (
         resposta
         .json()
-        .get("data", {})
+        .get(
+            "data",
+            {},
+        )
     )
 
 
@@ -484,27 +519,42 @@ def buscar_movimentacoes(
     resposta = requisicao_loy(
         f"{LOY_BASE_URL}/"
         f"{DATABASE_LOY}/"
-        f"movements/{id_processo}",
+        f"movements/"
+        f"{id_processo}",
         timeout=30,
     )
 
-    if resposta.status_code == 404:
+    if (
+        resposta.status_code
+        == 404
+    ):
         return {
-            "status": "FAIL",
-            "motivo": "HTTP 404",
-            "data_tentativa": data_tentativa,
-            "movs": [],
+            "status":
+                "FAIL",
+            "motivo":
+                "HTTP 404",
+            "data_tentativa":
+                data_tentativa,
+            "movs":
+                [],
         }
 
     return {
-        "status": "SUCCESS",
-        "motivo": "",
-        "data_tentativa": data_tentativa,
-        "movs": (
-            resposta
-            .json()
-            .get("data", [])
-        ),
+        "status":
+            "SUCCESS",
+        "motivo":
+            "",
+        "data_tentativa":
+            data_tentativa,
+        "movs":
+            (
+                resposta
+                .json()
+                .get(
+                    "data",
+                    [],
+                )
+            ),
     }
 
 
@@ -524,18 +574,25 @@ def buscar_intermediarias_por_data(
     )
 
     todas = []
+
     ids_encontrados = set()
+
     pagina = 1
 
     while True:
         url = (
-            f"{LOY_INTERMEDIARIAS_URL}/workloads?"
+            f"{LOY_INTERMEDIARIAS_URL}"
+            f"/workloads?"
             f"limit={limit}&"
             f"page={pagina}&"
-            f"params[kind]=Petição+Intermediária&"
-            f"params[success]=Sucesso&"
-            f"params[dateStart]={data_inicio_encoded}&"
-            f"params[dateEnd]={data_fim_encoded}&"
+            f"params[kind]="
+            f"Petição+Intermediária&"
+            f"params[success]="
+            f"Sucesso&"
+            f"params[dateStart]="
+            f"{data_inicio_encoded}&"
+            f"params[dateEnd]="
+            f"{data_fim_encoded}&"
             f"token={LOY_TOKEN}"
         )
 
@@ -544,13 +601,19 @@ def buscar_intermediarias_por_data(
             timeout=60,
         )
 
-        if resposta.status_code == 404:
+        if (
+            resposta.status_code
+            == 404
+        ):
             break
 
         workloads = (
             resposta
             .json()
-            .get("workloads", [])
+            .get(
+                "workloads",
+                [],
+            )
         )
 
         if not workloads:
@@ -559,24 +622,36 @@ def buscar_intermediarias_por_data(
         novos = []
 
         for item in workloads:
-            item_id = item.get("_id")
+            item_id = item.get(
+                "_id"
+            )
 
             if item_id:
-                if item_id in ids_encontrados:
+                if (
+                    item_id
+                    in ids_encontrados
+                ):
                     continue
 
                 ids_encontrados.add(
                     item_id
                 )
 
-            novos.append(item)
+            novos.append(
+                item
+            )
 
         if not novos:
             break
 
-        todas.extend(novos)
+        todas.extend(
+            novos
+        )
 
-        if len(workloads) < limit:
+        if (
+            len(workloads)
+            < limit
+        ):
             break
 
         pagina += 1
@@ -585,7 +660,9 @@ def buscar_intermediarias_por_data(
 
 
 def criar_mapa_intermediarias():
-    hoje = datetime.datetime.now()
+    hoje = datetime.datetime.now(
+        FUSO_BRASILIA
+    )
 
     data_fim = hoje.strftime(
         "%d/%m/%Y"
@@ -593,7 +670,9 @@ def criar_mapa_intermediarias():
 
     data_inicio = (
         hoje
-        - datetime.timedelta(days=60)
+        - datetime.timedelta(
+            days=60
+        )
     ).strftime(
         "%d/%m/%Y"
     )
@@ -609,22 +688,29 @@ def criar_mapa_intermediarias():
     mapa = {}
 
     for intermediaria in intermediarias:
-
-        justice = intermediaria.get(
-            "justice",
-            {},
+        justice = (
+            intermediaria
+            .get(
+                "justice",
+                {},
+            )
+            or {}
         )
 
-        justice_id = justice.get(
-            "_id"
+        justice_id = (
+            justice.get(
+                "_id"
+            )
         )
 
         if not justice_id:
             continue
 
-        mapa[justice_id] = {
+        novo = {
             "intermediate_id":
-                intermediaria.get("_id"),
+                intermediaria.get(
+                    "_id"
+                ),
 
             "intermediate_situation":
                 intermediaria.get(
@@ -666,30 +752,53 @@ def criar_mapa_intermediarias():
                 ),
         }
 
+        atual = mapa.get(
+            justice_id
+        )
+
+        if not atual:
+            mapa[
+                justice_id
+            ] = novo
+            continue
+
+        data_atual = str(
+            atual.get(
+                "intermediate_createdAt",
+                "",
+            )
+        )
+
+        data_nova = str(
+            novo.get(
+                "intermediate_createdAt",
+                "",
+            )
+        )
+
+        if (
+            data_nova
+            >= data_atual
+        ):
+            mapa[
+                justice_id
+            ] = novo
+
     return mapa
 
 
-def processar_processo(
+def montar_resultado(
     numero_processo,
+    id_processo,
+    titulo,
+    situacao,
+    is_worked,
+    mov_result,
     mapa_intermediarias,
 ):
-    capa = buscar_capa_processo(
-        numero_processo
+    movimentacoes = (
+        mov_result["movs"]
     )
-
-    if not capa:
-        return None
-
-    id_processo = capa.get("_id")
-
-    if not id_processo:
-        return None
-
-    mov_result = buscar_movimentacoes(
-        id_processo
-    )
-
-    movimentacoes = mov_result["movs"]
 
     ultima_movimentacao = (
         max(
@@ -718,28 +827,23 @@ def processar_processo(
             id_processo,
 
         "titulo":
-            capa.get(
-                "title",
-                "",
-            ),
+            titulo or "",
 
         "situacao":
-            capa.get(
-                "situation",
-                "",
-            ),
+            situacao or "",
 
         "is_worked":
-            capa.get(
-                "isWorked",
-                False,
-            ),
+            is_worked,
 
         "captura_status":
-            mov_result["status"],
+            mov_result[
+                "status"
+            ],
 
         "captura_motivo":
-            mov_result["motivo"],
+            mov_result[
+                "motivo"
+            ],
 
         "captura_data":
             mov_result[
@@ -808,20 +912,156 @@ def processar_processo(
     }
 
 
+def processar_processo(
+    numero_processo,
+    cache,
+    mapa_intermediarias,
+    atualizar_capa,
+):
+    chave = chave_processo(
+        numero_processo
+    )
+
+    registro_cache = (
+        cache.get(
+            chave,
+            {},
+        )
+    )
+
+    id_cache = (
+        registro_cache
+        .get(
+            "id_processo"
+        )
+    )
+
+    usar_cache = (
+        bool(id_cache)
+        and not atualizar_capa
+    )
+
+    if usar_cache:
+        id_processo = (
+            id_cache
+        )
+
+        titulo = (
+            registro_cache
+            .get(
+                "titulo",
+                "",
+            )
+        )
+
+        situacao = (
+            registro_cache
+            .get(
+                "situacao",
+                "",
+            )
+        )
+
+        is_worked = (
+            registro_cache
+            .get(
+                "is_worked",
+                "",
+            )
+        )
+
+        mov_result = (
+            buscar_movimentacoes(
+                id_processo
+            )
+        )
+
+        if (
+            mov_result[
+                "motivo"
+            ]
+            != "HTTP 404"
+        ):
+            return montar_resultado(
+                numero_processo,
+                id_processo,
+                titulo,
+                situacao,
+                is_worked,
+                mov_result,
+                mapa_intermediarias,
+            )
+
+    capa = buscar_capa_processo(
+        numero_processo
+    )
+
+    if not capa:
+        return None
+
+    id_processo = (
+        capa.get("_id")
+    )
+
+    if not id_processo:
+        return None
+
+    mov_result = (
+        buscar_movimentacoes(
+            id_processo
+        )
+    )
+
+    return montar_resultado(
+        numero_processo,
+        id_processo,
+        capa.get(
+            "title",
+            "",
+        ),
+        capa.get(
+            "situation",
+            "",
+        ),
+        capa.get(
+            "isWorked",
+            False,
+        ),
+        mov_result,
+        mapa_intermediarias,
+    )
+
+
 def criar_dataframe(
     resultados,
 ):
     if not resultados:
         raise RuntimeError(
-            "Nenhum dado do LOY foi processado"
+            "Nenhum dado do LOY "
+            "foi processado."
         )
 
     df = pd.DataFrame(
         resultados
     )
 
-    df.columns = normalizar_colunas(
-        df.columns
+    df.columns = (
+        normalizar_colunas(
+            df.columns
+        )
+    )
+
+    df = (
+        df
+        .drop_duplicates(
+            subset=[
+                "processo"
+            ],
+            keep="last",
+        )
+        .reset_index(
+            drop=True
+        )
     )
 
     df.insert(
@@ -836,14 +1076,15 @@ def criar_dataframe(
     for coluna in df.columns:
         df[coluna] = (
             df[coluna]
-            .map(preparar_valor)
+            .map(
+                preparar_valor
+            )
         )
 
     return df
 
 
 def inserir_lote(
-    supabase,
     lote,
     tentativas=5,
 ):
@@ -856,8 +1097,12 @@ def inserir_lote(
         try:
             (
                 supabase
-                .table(TABELA)
-                .insert(lote)
+                .table(
+                    TABELA_LOY
+                )
+                .insert(
+                    lote
+                )
                 .execute()
             )
 
@@ -866,62 +1111,128 @@ def inserir_lote(
         except Exception as erro:
             ultimo_erro = erro
 
-            if tentativa < tentativas:
+            if (
+                tentativa
+                < tentativas
+            ):
                 time.sleep(
-                    tentativa * 2
+                    min(
+                        30,
+                        tentativa * 3,
+                    )
                 )
 
     raise ultimo_erro
 
 
-def enviar_supabase(df):
-    supabase = create_client(
-        env("SUPABASE_URL"),
-        env(
-            "SUPABASE_SERVICE_ROLE_KEY"
-        ),
+def validar_quantidade(
+    esperado,
+):
+    resposta = (
+        supabase
+        .table(
+            TABELA_LOY
+        )
+        .select(
+            "*",
+            count="exact",
+        )
+        .limit(1)
+        .execute()
     )
 
+    encontrado = (
+        resposta.count
+    )
+
+    if encontrado is None:
+        return
+
+    if (
+        encontrado
+        != esperado
+    ):
+        raise RuntimeError(
+            f"Validação LOY falhou. "
+            f"Esperado: "
+            f"{esperado:,} | "
+            f"Supabase: "
+            f"{encontrado:,}"
+        )
+
+
+def enviar_supabase(df):
     supabase.rpc(
         "preparar_carga_iilex",
         {
-            "p_tabela": TABELA,
+            "p_tabela":
+                TABELA_LOY,
+
             "p_colunas":
                 df.columns.tolist(),
         },
     ).execute()
 
+    time.sleep(2)
+
     registros = df.to_dict(
         orient="records"
     )
 
+    total = len(
+        registros
+    )
+
     for inicio in range(
         0,
-        len(registros),
-        LOTE_SUPABASE,
+        total,
+        LOTE_ESCRITA_SUPABASE,
     ):
         lote = registros[
             inicio:
-            inicio + LOTE_SUPABASE
+            inicio
+            + LOTE_ESCRITA_SUPABASE
         ]
 
         inserir_lote(
-            supabase,
-            lote,
+            lote
         )
 
+        enviados = min(
+            inicio
+            + LOTE_ESCRITA_SUPABASE,
+            total,
+        )
 
-def main():
-    mapa_intermediarias = (
-        criar_mapa_intermediarias()
+        if (
+            enviados == total
+            or enviados % 5000 == 0
+        ):
+            print(
+                f"Supabase LOY: "
+                f"{enviados:,}/"
+                f"{total:,}"
+            )
+
+    validar_quantidade(
+        total
     )
 
-    processos = (
-        buscar_processos_iilex()
-    )
 
+def executar_processos(
+    processos,
+    cache,
+    mapa_intermediarias,
+    atualizar_capa,
+):
     resultados = []
     falhas = []
+
+    total = len(
+        processos
+    )
+
+    inicio = time.time()
 
     with ThreadPoolExecutor(
         max_workers=LOY_MAX_WORKERS
@@ -931,17 +1242,23 @@ def main():
             executor.submit(
                 processar_processo,
                 processo,
+                cache,
                 mapa_intermediarias,
+                atualizar_capa,
             ): processo
             for processo in processos
         }
 
-        concluídos = 0
+        concluidos = 0
 
         for future in as_completed(
             futures
         ):
-            processo = futures[future]
+            processo = (
+                futures[
+                    future
+                ]
+            )
 
             try:
                 resultado = (
@@ -961,34 +1278,86 @@ def main():
                     )
                 )
 
-            concluídos += 1
+            concluidos += 1
 
-            if concluídos % 500 == 0:
+            if (
+                concluidos % 500 == 0
+                or concluidos == total
+            ):
+                minutos = (
+                    time.time()
+                    - inicio
+                ) / 60
+
                 print(
                     f"LOY: "
-                    f"{concluídos}/"
-                    f"{len(processos)} "
-                    f"processos"
+                    f"{concluidos:,}/"
+                    f"{total:,} | "
+                    f"{minutos:.1f} min | "
+                    f"falhas: "
+                    f"{len(falhas):,}"
                 )
 
-    if falhas:
-        print(
-            f"Repetindo "
-            f"{len(falhas)} "
-            f"processos com falha"
-        )
+    return (
+        resultados,
+        falhas,
+    )
 
-        time.sleep(30)
 
-        falhas_finais = []
+def repetir_falhas(
+    falhas,
+    cache,
+    mapa_intermediarias,
+    atualizar_capa,
+):
+    if not falhas:
+        return [], []
 
-        for processo, _ in falhas:
+    print(
+        f"Repetindo "
+        f"{len(falhas):,} "
+        f"processos com falha"
+    )
+
+    time.sleep(30)
+
+    resultados = []
+    falhas_finais = []
+
+    processos = [
+        processo
+        for processo, _
+        in falhas
+    ]
+
+    with ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                processar_processo,
+                processo,
+                cache,
+                mapa_intermediarias,
+                atualizar_capa,
+            ): processo
+            for processo
+            in processos
+        }
+
+        for future in as_completed(
+            futures
+        ):
+            processo = (
+                futures[
+                    future
+                ]
+            )
+
             try:
                 resultado = (
-                    processar_processo(
-                        processo,
-                        mapa_intermediarias,
-                    )
+                    future.result()
                 )
 
                 if resultado:
@@ -1004,33 +1373,131 @@ def main():
                     )
                 )
 
-        if falhas_finais:
-            exemplos = "; ".join(
-                f"{processo}: "
-                f"{erro[:100]}"
-                for processo, erro
-                in falhas_finais[:5]
-            )
+    return (
+        resultados,
+        falhas_finais,
+    )
 
-            raise RuntimeError(
-                f"{len(falhas_finais)} "
-                f"processos continuaram "
-                f"com falha após nova "
-                f"tentativa. "
-                f"A tabela não será "
-                f"substituída. "
-                f"Exemplos: {exemplos}"
+
+def main():
+    hoje = datetime.datetime.now(
+        FUSO_BRASILIA
+    )
+
+    atualizar_capa = (
+        hoje.weekday() == 6
+    )
+
+    if atualizar_capa:
+        print(
+            "LOY: domingo - "
+            "atualização completa "
+            "das capas"
+        )
+    else:
+        print(
+            "LOY: modo diário rápido - "
+            "reutilizando IDs existentes"
+        )
+
+    processos = (
+        buscar_processos_contencioso()
+    )
+
+    cache = (
+        carregar_cache_loy()
+    )
+
+    com_cache = sum(
+        1
+        for processo
+        in processos
+        if (
+            cache.get(
+                chave_processo(
+                    processo
+                ),
+                {},
+            ).get(
+                "id_processo"
             )
+        )
+    )
+
+    novos = (
+        len(processos)
+        - com_cache
+    )
+
+    print(
+        f"Contencioso: "
+        f"{len(processos):,} processos | "
+        f"IDs reutilizáveis: "
+        f"{com_cache:,} | "
+        f"sem ID: "
+        f"{novos:,}"
+    )
+
+    mapa_intermediarias = (
+        criar_mapa_intermediarias()
+    )
+
+    print(
+        f"Petições intermediárias: "
+        f"{len(mapa_intermediarias):,} "
+        f"processos"
+    )
+
+    resultados, falhas = (
+        executar_processos(
+            processos,
+            cache,
+            mapa_intermediarias,
+            atualizar_capa,
+        )
+    )
+
+    novos_resultados, falhas_finais = (
+        repetir_falhas(
+            falhas,
+            cache,
+            mapa_intermediarias,
+            atualizar_capa,
+        )
+    )
+
+    resultados.extend(
+        novos_resultados
+    )
+
+    if falhas_finais:
+        exemplos = "; ".join(
+            f"{processo}: "
+            f"{erro[:120]}"
+            for processo, erro
+            in falhas_finais[:5]
+        )
+
+        raise RuntimeError(
+            f"{len(falhas_finais):,} "
+            f"processos continuaram "
+            f"com falha. "
+            f"A tabela LOY não será "
+            f"substituída. "
+            f"Exemplos: {exemplos}"
+        )
 
     df = criar_dataframe(
         resultados
     )
 
-    enviar_supabase(df)
+    enviar_supabase(
+        df
+    )
 
     print(
         f"LOY atualizado: "
-        f"{len(df)} registros"
+        f"{len(df):,} registros"
     )
 
 
