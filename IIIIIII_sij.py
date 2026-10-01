@@ -1,6 +1,5 @@
 import os
 import io
-import re
 import json
 import base64
 import time
@@ -21,7 +20,12 @@ from supabase import create_client
 load_dotenv()
 
 SPREADSHEET_ID = "1r1RHLxkmTOt6uka1yE122R8Ic3WyYcec"
-TABELA_SUPABASE = "base_sij_tratada"
+
+# IMPORTANTE:
+# base_sij é a tabela física que recebe a carga.
+# base_sij_tratada é uma VIEW calculada automaticamente a partir dela.
+TABELA_SUPABASE = "base_sij"
+VIEW_TRATADA = "base_sij_tratada"
 
 ABA_SIJ = os.getenv("SIJ_ABA", "Negócios").strip() or "Negócios"
 LOTE_SUPABASE = int(os.getenv("SIJ_LOTE_SUPABASE", "200"))
@@ -37,9 +41,11 @@ MIME_XLSX = (
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-# A planilha possui uma linha de agrupadores e a segunda linha é o cabeçalho real.
+# A primeira linha contém agrupadores; a segunda contém o cabeçalho real.
 HEADER_EXCEL = 1
 
+# Somente os 15 campos físicos de public.base_sij.
+# Os demais campos de base_sij_tratada são calculados pela VIEW no PostgreSQL.
 MAPEAMENTO = {
     "ID Negócio": "id",
     "Número do processo": "processo",
@@ -48,9 +54,8 @@ MAPEAMENTO = {
     "Data estimada de liquidação": "data_estimada_liquidacao",
     "Última data de recebimento": "data_recebimento",
     "Valor do contrato (R$)": "valor_contrato",
-    "Total depositado (R$)": "valor_deposito",
     "Total recebido (R$)": "valor_recebido_liquidacao",
-    "Receita final (R$)": "receita",
+    "Total depositado (R$)": "valor_deposito",
     "ID iiLex": "id_illex",
     "Tribunal": "tribunal",
     "Tipos de crédito": "tipo_credito",
@@ -62,20 +67,13 @@ MAPEAMENTO = {
 COLUNAS_DESTINO = [
     "id",
     "processo",
-    "processo_normalizado",
     "numero_cumprimento",
-    "numero_cumprimento_normalizado",
     "data_base_venda",
     "data_estimada_liquidacao",
     "data_recebimento",
     "valor_contrato",
-    "valor_deposito",
     "valor_recebido_liquidacao",
-    "receita",
-    "recebido",
-    "mes_venda",
-    "mes_estimado_liquidacao",
-    "mes_recebimento",
+    "valor_deposito",
     "id_illex",
     "tribunal",
     "tipo_credito",
@@ -226,19 +224,24 @@ def baixar_arquivo_sij():
 def vazio(valor):
     if valor is None:
         return True
+
     try:
         if pd.isna(valor):
             return True
     except Exception:
         pass
+
     if isinstance(valor, str) and valor.strip().lower() in {
         "",
         "nan",
         "none",
         "null",
         "-",
+        "nat",
+        "<na>",
     }:
         return True
+
     return False
 
 
@@ -259,16 +262,33 @@ def texto(valor):
     return resultado or None
 
 
-def normalizar_numero_processo(valor):
-    valor = texto(valor)
-    if valor is None:
+def texto_data(valor):
+    """Entrega data em texto pt-BR, formato aceito por parse_data_ptbr."""
+
+    if vazio(valor):
         return None
 
-    digitos = re.sub(r"\D", "", valor)
-    return digitos or None
+    if isinstance(valor, pd.Timestamp):
+        return valor.strftime("%d/%m/%Y")
+
+    if isinstance(valor, datetime):
+        return valor.strftime("%d/%m/%Y")
+
+    if isinstance(valor, date):
+        return valor.strftime("%d/%m/%Y")
+
+    # Serial numérico do Excel.
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        numero = float(valor)
+        if 1 <= numero <= 100000:
+            data_excel = datetime(1899, 12, 30) + timedelta(days=numero)
+            return data_excel.strftime("%d/%m/%Y")
+
+    # Se o Excel trouxe a data como texto, preservamos o formato original.
+    return texto(valor)
 
 
-def converter_numero(valor):
+def numero_para_float(valor):
     if vazio(valor):
         return None
 
@@ -277,17 +297,16 @@ def converter_numero(valor):
 
     if isinstance(valor, (int, float)):
         numero = float(valor)
-        if pd.isna(numero):
-            return None
-        return numero
+        return None if pd.isna(numero) else numero
 
     s = str(valor).strip()
     s = s.replace("R$", "").replace(" ", "")
 
-    if s in {"", "-"}:
+    if not s or s == "-":
         return None
 
-    # 1.234,56 -> 1234.56 | 1,234.56 -> 1234.56
+    # 1.234,56 -> 1234.56
+    # 1,234.56 -> 1234.56
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
@@ -296,7 +315,7 @@ def converter_numero(valor):
     elif "," in s:
         s = s.replace(".", "").replace(",", ".")
 
-    s = re.sub(r"[^0-9+\-.]", "", s)
+    s = "".join(ch for ch in s if ch in "0123456789+-.eE")
 
     if s in {"", "+", "-", ".", "+.", "-."}:
         return None
@@ -307,54 +326,18 @@ def converter_numero(valor):
         return None
 
 
-def converter_data(valor):
-    if vazio(valor):
+def texto_numero(valor):
+    """Normaliza números para texto pt-BR sem separador de milhar."""
+
+    numero = numero_para_float(valor)
+    if numero is None:
         return None
 
-    if isinstance(valor, pd.Timestamp):
-        return valor.date().isoformat()
+    s = f"{numero:.10f}".rstrip("0").rstrip(".")
+    if s == "-0":
+        s = "0"
 
-    if isinstance(valor, datetime):
-        return valor.date().isoformat()
-
-    if isinstance(valor, date):
-        return valor.isoformat()
-
-    # Excel serial date, caso venha como número cru.
-    if isinstance(valor, (int, float)):
-        numero = float(valor)
-        if 1 <= numero <= 100000:
-            data_excel = datetime(1899, 12, 30) + timedelta(days=numero)
-            return data_excel.date().isoformat()
-
-    s = str(valor).strip()
-
-    # Serial do Excel vindo como texto.
-    if re.fullmatch(r"\d+(?:\.\d+)?", s):
-        try:
-            numero = float(s)
-            if 1 <= numero <= 100000:
-                data_excel = datetime(1899, 12, 30) + timedelta(days=numero)
-                return data_excel.date().isoformat()
-        except ValueError:
-            pass
-
-    data_convertida = pd.to_datetime(
-        s,
-        errors="coerce",
-        dayfirst=True,
-    )
-
-    if pd.isna(data_convertida):
-        return None
-
-    return data_convertida.date().isoformat()
-
-
-def primeiro_dia_mes(data_iso):
-    if not data_iso:
-        return None
-    return f"{data_iso[:7]}-01"
+    return s.replace(".", ",")
 
 
 def ler_sij():
@@ -392,11 +375,11 @@ def ler_sij():
             + ", ".join(faltantes)
         )
 
-    # Mantém exclusivamente as colunas usadas pela base_sij_tratada.
+    # Mantém exclusivamente os 15 campos físicos usados por public.base_sij.
     df = df[list(MAPEAMENTO.keys())].copy()
     df = df.rename(columns=MAPEAMENTO)
 
-    # Textos/IDs.
+    # IDs e textos.
     for coluna in [
         "id",
         "processo",
@@ -410,45 +393,27 @@ def ler_sij():
     ]:
         df[coluna] = df[coluna].map(texto)
 
-    # Datas.
+    # As três datas permanecem TEXT na base_sij.
+    # A view base_sij_tratada chama parse_data_ptbr() sobre elas.
     for coluna in [
         "data_base_venda",
         "data_estimada_liquidacao",
         "data_recebimento",
     ]:
-        df[coluna] = df[coluna].map(converter_data)
+        df[coluna] = df[coluna].map(texto_data)
 
-    # Valores.
+    # Os três valores também permanecem TEXT na base_sij.
+    # A view chama parse_numero() e calcula receita = contrato - depósito.
     for coluna in [
         "valor_contrato",
-        "valor_deposito",
         "valor_recebido_liquidacao",
-        "receita",
+        "valor_deposito",
     ]:
-        df[coluna] = df[coluna].map(converter_numero)
-
-    # Campos derivados já existentes em public.base_sij_tratada.
-    df["processo_normalizado"] = df["processo"].map(
-        normalizar_numero_processo
-    )
-    df["numero_cumprimento_normalizado"] = df[
-        "numero_cumprimento"
-    ].map(normalizar_numero_processo)
-
-    df["recebido"] = df["data_recebimento"].notna()
-
-    df["mes_venda"] = df["data_base_venda"].map(primeiro_dia_mes)
-    df["mes_estimado_liquidacao"] = df[
-        "data_estimada_liquidacao"
-    ].map(primeiro_dia_mes)
-    df["mes_recebimento"] = df["data_recebimento"].map(
-        primeiro_dia_mes
-    )
+        df[coluna] = df[coluna].map(texto_numero)
 
     df = df[COLUNAS_DESTINO]
 
-    # Segurança: a origem atual possui milhares de registros. Não limpamos o
-    # Supabase se a leitura vier vazia/quebrada por alteração do arquivo.
+    # Segurança antes de tocar no Supabase.
     if len(df) < MIN_REGISTROS:
         raise RuntimeError(
             f"Carga abortada: somente {len(df):,} registros encontrados. "
@@ -472,15 +437,24 @@ def ler_sij():
     df = df.astype(object).where(pd.notna(df), None)
 
     print()
-    print("Mapeamento SIJ -> base_sij_tratada")
+    print("Mapeamento SIJ -> public.base_sij")
     print("------------------------------")
     for origem, destino in MAPEAMENTO.items():
         print(f"{origem} -> {destino}")
 
     print()
     print("Registros encontrados:", f"{len(df):,}")
-    print("Quantidade de colunas:", len(df.columns))
-    print("Recebidos:", f"{int(df['recebido'].sum()):,}")
+    print("Quantidade de colunas físicas:", len(df.columns))
+    print(
+        "Registros com data de recebimento:",
+        f"{int(df['data_recebimento'].notna().sum()):,}",
+    )
+    print()
+    print(
+        "Observação: processo_normalizado, numero_cumprimento_normalizado, "
+        "receita, recebido e campos mes_* serão calculados pela view "
+        "public.base_sij_tratada."
+    )
 
     return df
 
@@ -504,8 +478,7 @@ def limpar_tabela(supabase):
     print()
     print(f"Limpando public.{TABELA_SUPABASE}...")
 
-    # PostgREST exige filtro em DELETE. A primeira chamada remove IDs não nulos;
-    # a segunda garante a remoção de eventual linha antiga com id NULL.
+    # PostgREST exige filtro em DELETE.
     (
         supabase.table(TABELA_SUPABASE)
         .delete()
@@ -513,6 +486,7 @@ def limpar_tabela(supabase):
         .execute()
     )
 
+    # Segurança para eventual linha antiga com id NULL.
     (
         supabase.table(TABELA_SUPABASE)
         .delete()
@@ -545,44 +519,70 @@ def inserir_lote(supabase, lote):
     raise ultimo_erro
 
 
-def validar_carga(supabase, total_esperado):
+def contar(supabase, tabela):
     resposta = (
-        supabase.table(TABELA_SUPABASE)
+        supabase.table(tabela)
         .select("*", count="exact")
         .limit(1)
         .execute()
     )
 
-    total_supabase = resposta.count
-
-    if total_supabase is None:
+    if resposta.count is None:
         raise RuntimeError(
-            "Não foi possível validar a quantidade no Supabase."
+            f"Não foi possível contar os registros de public.{tabela}."
         )
 
-    if total_supabase != total_esperado:
+    return resposta.count
+
+
+def validar_carga(supabase, total_esperado):
+    total_base = contar(supabase, TABELA_SUPABASE)
+    total_view = contar(supabase, VIEW_TRATADA)
+
+    if total_base != total_esperado:
         raise RuntimeError(
-            "Validação da SIJ falhou. "
+            "Validação da tabela física falhou. "
             f"Planilha: {total_esperado:,} | "
-            f"Supabase: {total_supabase:,}"
+            f"base_sij: {total_base:,}"
         )
+
+    if total_view != total_esperado:
+        raise RuntimeError(
+            "Validação da view tratada falhou. "
+            f"Planilha: {total_esperado:,} | "
+            f"base_sij_tratada: {total_view:,}"
+        )
+
+    # Validação de leitura dos campos calculados da view.
+    amostra = (
+        supabase.table(VIEW_TRATADA)
+        .select(
+            "id,processo_normalizado,data_base_venda,"
+            "valor_contrato,receita,recebido,mes_venda"
+        )
+        .limit(5)
+        .execute()
+    )
 
     print()
-    print("Validação OK:", f"{total_supabase:,}", "registros")
+    print("Validação OK")
+    print("------------------------------")
+    print("base_sij:", f"{total_base:,}", "registros")
+    print("base_sij_tratada:", f"{total_view:,}", "registros")
+    print("Amostra da view tratada lida com sucesso:", len(amostra.data))
 
 
 def enviar_supabase(df):
     supabase = criar_supabase()
 
-    # Só limpa depois de toda a leitura, validação de colunas, transformação e
-    # checagens de segurança terem terminado com sucesso.
+    # A leitura e todas as validações locais acontecem antes do DELETE.
     limpar_tabela(supabase)
 
     registros = df.to_dict(orient="records")
     total = len(registros)
 
     print()
-    print("Enviando ao Supabase...")
+    print(f"Enviando para public.{TABELA_SUPABASE}...")
 
     for inicio in range(0, total, LOTE_SUPABASE):
         fim = min(inicio + LOTE_SUPABASE, total)
