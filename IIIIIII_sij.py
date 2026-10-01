@@ -44,7 +44,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 # A primeira linha contém agrupadores; a segunda contém o cabeçalho real.
 HEADER_EXCEL = 1
 
-# Somente os 15 campos físicos de public.base_sij.
+# Somente os 16 campos físicos de public.base_sij.
 # Os demais campos de base_sij_tratada são calculados pela VIEW no PostgreSQL.
 MAPEAMENTO = {
     "ID Negócio": "id",
@@ -52,6 +52,7 @@ MAPEAMENTO = {
     "Nº cumprimento de sentença": "numero_cumprimento",
     "Data base da venda": "data_base_venda",
     "Data estimada de liquidação": "data_estimada_liquidacao",
+    "Prazo liquidação (meses)": "prazo_liquidacao_meses",
     "Última data de recebimento": "data_recebimento",
     "Valor do contrato (R$)": "valor_contrato",
     "Total recebido (R$)": "valor_recebido_liquidacao",
@@ -70,6 +71,7 @@ COLUNAS_DESTINO = [
     "numero_cumprimento",
     "data_base_venda",
     "data_estimada_liquidacao",
+    "prazo_liquidacao_meses",
     "data_recebimento",
     "valor_contrato",
     "valor_recebido_liquidacao",
@@ -375,7 +377,7 @@ def ler_sij():
             + ", ".join(faltantes)
         )
 
-    # Mantém exclusivamente os 15 campos físicos usados por public.base_sij.
+    # Mantém exclusivamente os 16 campos físicos usados por public.base_sij.
     df = df[list(MAPEAMENTO.keys())].copy()
     df = df.rename(columns=MAPEAMENTO)
 
@@ -402,9 +404,10 @@ def ler_sij():
     ]:
         df[coluna] = df[coluna].map(texto_data)
 
-    # Os três valores também permanecem TEXT na base_sij.
+    # O prazo e os três valores também permanecem TEXT na base_sij.
     # A view chama parse_numero() e calcula receita = contrato - depósito.
     for coluna in [
+        "prazo_liquidacao_meses",
         "valor_contrato",
         "valor_recebido_liquidacao",
         "valor_deposito",
@@ -558,7 +561,7 @@ def validar_carga(supabase, total_esperado):
         supabase.table(VIEW_TRATADA)
         .select(
             "id,processo_normalizado,data_base_venda,"
-            "valor_contrato,receita,recebido,mes_venda"
+            "valor_contrato,receita,recebido,mes_venda,prazo_liquidacao_meses"
         )
         .limit(5)
         .execute()
