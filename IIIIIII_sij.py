@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SPREADSHEET_ID = "1r1RHLxkmTOt6uka1yE122R8Ic3WyYcec"
+SPREADSHEET_ID = "1g23T30i59RD0S5arYil_ckhihaGMn30O"
 
 # base_sij é a tabela física que recebe a carga.
 # base_sij_tratada é uma VIEW calculada automaticamente a partir dela.
