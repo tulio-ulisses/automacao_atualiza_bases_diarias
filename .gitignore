@@ -6,3 +6,5 @@ venv/
 .env.*
 *.log
 resultado_final_fallback.xlsx
+cred.py
+cred.py
