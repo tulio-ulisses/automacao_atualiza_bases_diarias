@@ -1,0 +1,64 @@
+name: Auditoria IILEX - logs diarios
+
+on:
+  workflow_dispatch:
+    inputs:
+      data:
+        description: 'Opcional: reprocessar dia especifico (AAAA-MM-DD). Vazio = ontem.'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 3 * * *'
+      timezone: 'America/Recife'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auditoria-iilex-diaria
+  cancel-in-progress: false
+
+jobs:
+  coletar-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      IILEX_USERNAME: ${{ secrets.IILEX_USERNAME }}
+      IILEX_PASSWORD: ${{ secrets.IILEX_PASSWORD }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATA_MANUAL: ${{ inputs.data || '' }}
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Validar credenciais
+        shell: bash
+        run: |
+          test -n "$IILEX_USERNAME" || { echo 'Secret IILEX_USERNAME ausente'; exit 1; }
+          test -n "$IILEX_PASSWORD" || { echo 'Secret IILEX_PASSWORD ausente'; exit 1; }
+          test -n "$SUPABASE_URL" || { echo 'Secret SUPABASE_URL ausente'; exit 1; }
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo 'Secret SUPABASE_SERVICE_ROLE_KEY ausente'; exit 1; }
+
+      - name: Consultar ontem ou data manual
+        shell: bash
+        run: |
+          if [[ -z "$DATA_MANUAL" ]]; then
+            python auditoria_iilex_diaria.py --modo diario --gravar
+          elif [[ "$DATA_MANUAL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            python auditoria_iilex_diaria.py --modo recuperar --inicio "$DATA_MANUAL" --fim "$DATA_MANUAL" --gravar
+          else
+            echo 'Data invalida: use AAAA-MM-DD.'
+            exit 1
+          fi
