@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SPREADSHEET_ID = "1g23T30i59RD0S5arYil_ckhihaGMn30O"
+PASTA_SIJ_ID = "17c_h5S5DRNhjbFDab8mRCf4gGHoidWIj"
+NOME_ARQUIVO_SIJ = "base_sij.xlsx"
 
 # base_sij é a tabela física que recebe a carga.
 # base_sij_tratada é uma VIEW calculada automaticamente a partir dela.
@@ -34,7 +35,6 @@ LOTE_SUPABASE = int(os.getenv("SIJ_LOTE_SUPABASE", "200"))
 MAX_TENTATIVAS = 4
 MIN_REGISTROS = int(os.getenv("SIJ_MIN_REGISTROS", "100"))
 
-MIME_GOOGLE_SHEETS = "application/vnd.google-apps.spreadsheet"
 MIME_XLSX = (
     "application/"
     "vnd.openxmlformats-officedocument."
@@ -114,6 +114,55 @@ def env(*nomes):
 # ============================================================
 # GOOGLE DRIVE / ARQUIVO LOCAL
 # ============================================================
+
+
+def localizar_arquivo_sij(drive):
+    arquivos = []
+    pagina = None
+
+    while True:
+        resposta = drive.files().list(
+            q=(
+                f"'{PASTA_SIJ_ID}' in parents "
+                f"and name = '{NOME_ARQUIVO_SIJ}' "
+                "and trashed = false"
+            ),
+            fields=(
+                "nextPageToken,"
+                "files(id,name,mimeType,modifiedTime)"
+            ),
+            pageSize=100,
+            pageToken=pagina,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        arquivos.extend(resposta.get("files", []))
+        pagina = resposta.get("nextPageToken")
+
+        if not pagina:
+            break
+
+    if len(arquivos) != 1:
+        raise RuntimeError(
+            "Esperado exatamente 1 arquivo "
+            f"'{NOME_ARQUIVO_SIJ}' na pasta. "
+            f"Encontrados: {len(arquivos)}. "
+            "Carga cancelada. Verifique o nome, o acesso da conta "
+            f"de servico e a pasta {PASTA_SIJ_ID}."
+        )
+
+    arquivo = arquivos[0]
+
+    if arquivo["mimeType"] != MIME_XLSX:
+        raise RuntimeError(
+            "O arquivo encontrado não é um XLSX válido."
+        )
+
+    print("Arquivo SIJ encontrado:", arquivo["name"])
+    print("ID atual:", arquivo["id"])
+
+    return arquivo
 
 
 def carregar_credencial_google():
@@ -199,60 +248,41 @@ def abrir_arquivo_sij(caminho_local=None):
 
     drive = criar_drive()
 
+    # O arquivo e substituído periodicamente mantendo o mesmo nome.
+    # Localizar a cada execução evita depender de IDs antigos do Drive.
     try:
-        metadata = (
-            drive.files()
-            .get(
-                fileId=SPREADSHEET_ID,
-                fields="id,name,mimeType,capabilities(canDownload)",
-                supportsAllDrives=True,
-            )
-            .execute()
+        metadata = localizar_arquivo_sij(drive)
+        arquivo_id = metadata["id"]
+        request = drive.files().get_media(fileId=arquivo_id)
+
+        from googleapiclient.http import MediaIoBaseDownload
+
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(
+            buffer,
+            request,
+            chunksize=10 * 1024 * 1024,
         )
+
+        concluido = False
+        while not concluido:
+            status, concluido = downloader.next_chunk()
+            if status:
+                print("Download:", f"{status.progress() * 100:.1f}%")
+
+        if not buffer.tell():
+            raise RuntimeError("Download da SIJ retornou um arquivo vazio.")
+
+        buffer.seek(0)
+        return buffer
+
     except Exception as erro:
         raise RuntimeError(
-            "\nNão foi possível acessar o arquivo SIJ no Drive.\n"
-            "Compartilhe o arquivo com o e-mail da conta de serviço "
-            "mostrado acima.\n"
-            f"ID: {SPREADSHEET_ID}"
+            "Nao foi possivel localizar ou baixar base_sij.xlsx "
+            "na pasta configurada do Google Drive. "
+            "Confira se a conta de servico tem acesso a pasta/arquivo. "
+            f"Pasta: {PASTA_SIJ_ID}; arquivo: {NOME_ARQUIVO_SIJ}."
         ) from erro
-
-    nome = metadata.get("name", "SIJ")
-    mime_type = metadata.get("mimeType")
-
-    print()
-    print("Arquivo encontrado")
-    print("------------------------------")
-    print("Nome:", nome)
-    print("MIME:", mime_type)
-    print()
-
-    buffer = io.BytesIO()
-
-    if mime_type == MIME_GOOGLE_SHEETS:
-        request = drive.files().export_media(
-            fileId=SPREADSHEET_ID,
-            mimeType=MIME_XLSX,
-        )
-    else:
-        request = drive.files().get_media(fileId=SPREADSHEET_ID)
-
-    from googleapiclient.http import MediaIoBaseDownload
-
-    downloader = MediaIoBaseDownload(
-        buffer,
-        request,
-        chunksize=10 * 1024 * 1024,
-    )
-
-    concluido = False
-    while not concluido:
-        status, concluido = downloader.next_chunk()
-        if status:
-            print("Download:", f"{status.progress() * 100:.1f}%")
-
-    buffer.seek(0)
-    return buffer
 
 
 # ============================================================
