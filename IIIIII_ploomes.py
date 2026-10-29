@@ -21,7 +21,10 @@ from supabase import create_client
 
 load_dotenv()
 
-SPREADSHEET_ID = "1hKThy63LOAtaJugb8h3Grkx5_wQbe_FK"
+# Mesma pasta do Google Drive usada por IIIIIII_sij.py.
+# Localiza o XLSX pelo nome a cada execucao; nao depende do ID do arquivo.
+PASTA_PLOOMES_ID = "17c_h5S5DRNhjbFDab8mRCf4gGHoidWIj"
+NOME_ARQUIVO_PLOOMES = "base_ploomes.xlsx"
 
 TABELA_SUPABASE = "ploomes"
 
@@ -40,10 +43,6 @@ LOTE_SUPABASE = int(
 )
 
 MAX_TENTATIVAS = 4
-
-MIME_GOOGLE_SHEETS = (
-    "application/vnd.google-apps.spreadsheet"
-)
 
 MIME_XLSX = (
     "application/"
@@ -162,98 +161,97 @@ def criar_drive():
     )
 
 
+def localizar_arquivo_ploomes(drive):
+    """Localiza exatamente um base_ploomes.xlsx na pasta usada pela SIJ."""
+    arquivos = []
+    pagina = None
+
+    while True:
+        try:
+            resposta = drive.files().list(
+                q=(
+                    f"'{PASTA_PLOOMES_ID}' in parents "
+                    f"and name = '{NOME_ARQUIVO_PLOOMES}' "
+                    "and trashed = false"
+                ),
+                fields=(
+                    "nextPageToken,"
+                    "files(id,name,mimeType,modifiedTime)"
+                ),
+                pageSize=100,
+                pageToken=pagina,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+        except Exception as erro:
+            raise RuntimeError(
+                "Nao foi possivel consultar a pasta da Ploomes "
+                "no Google Drive. Confira o acesso da conta de servico "
+                f"a pasta {PASTA_PLOOMES_ID}."
+            ) from erro
+
+        arquivos.extend(resposta.get("files", []))
+        pagina = resposta.get("nextPageToken")
+        if not pagina:
+            break
+
+    if len(arquivos) != 1:
+        raise RuntimeError(
+            f"Esperado exatamente 1 arquivo '{NOME_ARQUIVO_PLOOMES}' "
+            f"na pasta {PASTA_PLOOMES_ID}. "
+            f"Encontrados: {len(arquivos)}. "
+            "Carga cancelada para evitar substituir a tabela "
+            "por um arquivo errado."
+        )
+
+    arquivo = arquivos[0]
+    if arquivo.get("mimeType") != MIME_XLSX:
+        raise RuntimeError(
+            f"'{NOME_ARQUIVO_PLOOMES}' foi encontrado, mas nao "
+            "e um arquivo Excel XLSX. Carga cancelada."
+        )
+
+    print()
+    print("Arquivo Ploomes encontrado")
+    print("------------------------------")
+    print("Nome:", arquivo["name"])
+    print("ID atual:", arquivo["id"])
+    print("MIME:", arquivo["mimeType"])
+    print()
+    return arquivo
+
+
 def baixar_arquivo_ploomes():
     drive = criar_drive()
+    arquivo = localizar_arquivo_ploomes(drive)
 
     try:
-        metadata = (
-            drive
-            .files()
-            .get(
-                fileId=SPREADSHEET_ID,
-                fields=(
-                    "id,"
-                    "name,"
-                    "mimeType,"
-                    "capabilities(canDownload)"
-                ),
-                supportsAllDrives=True,
-            )
-            .execute()
+        request = drive.files().get_media(fileId=arquivo["id"])
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(
+            buffer,
+            request,
+            chunksize=10 * 1024 * 1024,
         )
 
+        concluido = False
+        while not concluido:
+            status, concluido = downloader.next_chunk()
+            if status:
+                print("Download:", f"{status.progress() * 100:.1f}%")
     except Exception as erro:
         raise RuntimeError(
-            "\nNão foi possível acessar a planilha Ploomes.\n"
-            "Compartilhe o arquivo com o e-mail da "
-            "conta de serviço mostrado acima.\n"
-            f"ID: {SPREADSHEET_ID}"
+            f"Falha ao baixar '{NOME_ARQUIVO_PLOOMES}' "
+            f"(ID atual: {arquivo['id']})."
         ) from erro
 
-    nome = metadata.get(
-        "name",
-        "Ploomes",
-    )
-
-    mime_type = metadata.get(
-        "mimeType"
-    )
-
-    print()
-    print("Arquivo encontrado")
-    print("------------------------------")
-    print("Nome:", nome)
-    print("MIME:", mime_type)
-    print()
-
-    buffer = io.BytesIO()
-
-    # Google Sheets nativo:
-    # exporta como Excel.
-    if mime_type == MIME_GOOGLE_SHEETS:
-
-        request = (
-            drive
-            .files()
-            .export_media(
-                fileId=SPREADSHEET_ID,
-                mimeType=MIME_XLSX,
-            )
+    if buffer.getbuffer().nbytes == 0:
+        raise RuntimeError(
+            f"O download de '{NOME_ARQUIVO_PLOOMES}' veio vazio. "
+            "Carga cancelada."
         )
-
-    # Excel ou outro arquivo armazenado no Drive:
-    # baixa o arquivo diretamente.
-    else:
-
-        request = (
-            drive
-            .files()
-            .get_media(
-                fileId=SPREADSHEET_ID,
-            )
-        )
-
-    downloader = MediaIoBaseDownload(
-        buffer,
-        request,
-        chunksize=10 * 1024 * 1024,
-    )
-
-    concluido = False
-
-    while not concluido:
-        status, concluido = (
-            downloader.next_chunk()
-        )
-
-        if status:
-            print(
-                "Download:",
-                f"{status.progress() * 100:.1f}%"
-            )
 
     buffer.seek(0)
-
     return buffer
 
 
