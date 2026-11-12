@@ -134,7 +134,7 @@ class TestesCredenciais(unittest.TestCase):
         self.assertEqual(carregado["senha"], "senha_github")
         self.assertEqual(carregado["url_supabase"], variaveis["SUPABASE_URL"])
         self.assertEqual(carregado["token_supabase"], variaveis["SUPABASE_SERVICE_ROLE_KEY"])
-        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-recuperacao-automatica-v4-falhas-isoladas")
+        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-recuperacao-automatica-v5-fallback-particoes")
 
     def test_credenciais_legadas_continuam_aceitas(self):
         variaveis = {
@@ -545,3 +545,136 @@ class TestesExecucaoResiliente(unittest.TestCase):
         self.assertIn(date(2026,11,9), executados)
         self.assertIn(date(2026,11,8), executados)
         self.assertNotIn(date(2026,11,7), executados)
+
+
+class TestesFallbackHTTP500(unittest.TestCase):
+    def setUp(self):
+        self.usuarios = [{"id": str(i), "nome": f"Usuario {i}"} for i in range(1, 17)]
+        self.dia = date(2026, 11, 9)
+
+    def _evento(self, id_, marcador=None):
+        return {"id": f"log-{id_}-{marcador or 1}", "usuario": str(id_),
+                "data_evento": "2026-11-09 11:00:00"}
+
+    def _auditoria(self, eventos_por_usuario, alterar_segunda=False, overlap=False,
+                   falhar_subgrupo=False, erro_global=None):
+        usuarios = self.usuarios
+        class Falsa:
+            def __init__(self):
+                self.calls = []
+                self.rodadas = 0
+            def consultar(self, **kw):
+                ids = [str(u["id"]) for u in kw.get("usuarios", [])]
+                self.calls.append(ids)
+                if set(ids) == {str(u["id"]) for u in usuarios}:
+                    raise erro_global or mod.ErroHTTP500Persistente("500 global")
+                if falhar_subgrupo and len(ids)==8:
+                    raise mod.ErroHTTP500Persistente("500 em subgrupo")
+                # 1/2 e 3/4 consultas sao particoes distintas.
+                if len(ids)==8:
+                    self.rodadas += 1
+                registros = [r for id_ in ids for r in eventos_por_usuario.get(id_, [])]
+                if alterar_segunda and self.rodadas >= 3 and ids and len(ids)==8:
+                    registros = registros[:-1]  # altera a segunda particao
+                if overlap and '9' in ids:
+                    registros.append(self_evento('99', 'duplicado'))
+                if overlap and '1' in ids:
+                    registros.append(self_evento('99', 'duplicado'))
+                return len(registros), registros
+        self_evento = self._evento
+        return Falsa()
+
+    def test_http500_global_recupera_com_duas_particoes(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        # Duplicata legitima deve manter multiplicidade 2.
+        eventos['1'].append(dict(eventos['1'][0]))
+        auditoria = self._auditoria(eventos)
+        regs, total = mod.coletar_dia_com_retencao_de_erros(
+            auditoria, self.usuarios, self.dia)
+        self.assertEqual((len(regs), total), (17,17))
+        self.assertTrue(auditoria.coleta_por_particoes)
+        self.assertEqual(len(auditoria.calls), 5)  # pai + 2 + 2
+        self.assertEqual(mod.canonicalizar(regs[0]), mod.canonicalizar(regs[1]))
+
+    def test_fallback_usa_divisoes_independentes(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        aud = self._auditoria(eventos)
+        mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+        self.assertEqual(aud.calls[1], [str(i) for i in range(1,9)])
+        self.assertEqual(aud.calls[3], [str(i) for i in range(1,17,2)])
+
+    def test_fallback_recusa_dados_mutaveis(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        aud = self._auditoria(eventos, alterar_segunda=True)
+        with self.assertRaisesRegex(mod.DivergenciaAuditoria, 'independentes discordam'):
+            mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+
+    def test_fallback_recusa_sobreposicao(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        aud = self._auditoria(eventos, overlap=True)
+        with self.assertRaisesRegex(mod.DivergenciaAuditoria, 'apareceram em ambos'):
+            mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+
+    def test_fallback_subgrupo_http500_adiado(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        aud = self._auditoria(eventos, falhar_subgrupo=True)
+        with self.assertRaises(mod.ErroHTTP500Persistente):
+            mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+
+    def test_timeout_nao_ativa_particoes(self):
+        aud = self._auditoria({}, erro_global=mod.ErroServidorPersistente('timeout'))
+        with self.assertRaisesRegex(mod.ErroServidorPersistente,'timeout'):
+            mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+        self.assertEqual(len(aud.calls),1)
+
+    def test_limitador_impede_trafego_excessivo(self):
+        aud = self._auditoria({})
+        limited = mod.ConsultasFallbackLimitadas(aud, limite=2)
+        for i in range(2):
+            limited.consultar(usuarios=[self.usuarios[i]])
+        with self.assertRaisesRegex(mod.ErroServidorPersistente, 'limite de 2'):
+            limited.consultar(usuarios=[self.usuarios[2]])
+        self.assertEqual(len(aud.calls),2)
+
+    def test_sem_particoes_independentes_nao_grava(self):
+        with self.assertRaisesRegex(mod.ErroServidorPersistente, 'menos de 4'):
+            mod.coletar_por_particoes_apos_http500(object(),self.usuarios[:2],self.dia)
+
+    def test_http500_classificado_para_fallback_e_503_nao(self):
+        with self.assertRaises(mod.ErroHTTP500Temporario):
+            mod.validar_http(Mock(status_code=500))
+        with self.assertRaises(mod.ErroServidorTemporario) as cm:
+            mod.validar_http(Mock(status_code=503))
+        self.assertNotIsInstance(cm.exception, mod.ErroHTTP500Temporario)
+
+    def test_processamento_salva_validacao_alternativa(self):
+        eventos = {str(i): [self._evento(i)] for i in range(1,17)}
+        auditoria = self._auditoria(eventos)
+        banco = BancoFalso()
+        mod.processar_dia(banco, auditoria, self.usuarios, self.dia, 1, True)
+        logs = banco.dados[mod.TABELA_LOGS]
+        cargas = banco.dados[mod.TABELA_CARGAS]
+        self.assertEqual(len(logs),16)
+        self.assertEqual(cargas[0]['status'],'concluido')
+        self.assertIn('duas particoes independentes', cargas[0]['mensagem'])
+
+
+class TestesSegurancaExtraV5(unittest.TestCase):
+    def test_login_500_nao_ativa_fallback_de_filtros(self):
+        sessao = Mock()
+        sessao.headers = {"User-Agent": "teste"}
+        sessao.post.return_value = Mock(status_code=500)
+        with self.assertRaisesRegex(mod.ErroServidorTemporario, 'durante o login') as cm:
+            mod.fazer_login(sessao)
+        self.assertNotIsInstance(cm.exception, mod.ErroHTTP500Temporario)
+
+    def test_dados_divergentes_nao_sao_gravados(self):
+        modelo = TestesFallbackHTTP500()
+        modelo.setUp()
+        eventos = {str(i): [modelo._evento(i)] for i in range(1,17)}
+        aud = modelo._auditoria(eventos, alterar_segunda=True)
+        banco = BancoFalso()
+        with self.assertRaises(mod.DivergenciaAuditoria):
+            mod.processar_dia(banco, aud, modelo.usuarios, modelo.dia, 1, True)
+        self.assertEqual(len(banco.dados[mod.TABELA_LOGS]),0)
+        self.assertEqual(banco.dados[mod.TABELA_CARGAS][0]['status'], 'erro')

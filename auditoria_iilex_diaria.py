@@ -26,7 +26,7 @@ if not all((user, senha, url_supabase, token_supabase)):
         pass
 
 
-VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v4-falhas-isoladas"
+VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v5-fallback-particoes"
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
 
@@ -50,6 +50,10 @@ PAUSA_HTTP_TEMPORARIO = 120
 # Depois de dois dias distintos com HTTP 5xx/timeout persistente, interromper
 # o restante da execucao para proteger o servidor IILEX.
 MAX_DIAS_ERRO_SERVIDOR = 2
+
+# Fallback para HTTP 500 exclusivo da consulta de 16 usuarios.
+# Limite de consultas logicas; cada uma admite no maximo 2 chamadas HTTP.
+MAX_CONSULTAS_FALLBACK = 16
 
 LIMITE_REQUISICAO = 1000
 
@@ -76,6 +80,16 @@ class ErroServidorTemporario(ErroServidor):
 
 class ErroServidorPersistente(ErroServidor):
     """5xx/timeout/conexao persistente apos repetir com pausa; dia pendente."""
+    pass
+
+
+class ErroHTTP500Temporario(ErroServidorTemporario):
+    """HTTP 500: permite diagnostico por particoes somente apos retry."""
+    pass
+
+
+class ErroHTTP500Persistente(ErroServidorPersistente):
+    """HTTP 500 persistente; pode ser especifico do filtro global."""
     pass
 
 
@@ -187,6 +201,11 @@ def validar_http(resposta):
             "Execução interrompida por segurança."
         )
 
+    if resposta.status_code == 500:
+        raise ErroHTTP500Temporario(
+            "IILEX respondeu HTTP 500. Execucao interrompida por seguranca."
+        )
+
     if resposta.status_code >= 500:
         raise ErroServidorTemporario(
             f"IILEX respondeu HTTP {resposta.status_code}. "
@@ -240,7 +259,15 @@ def fazer_login(sessao):
             f"Erro de comunicação durante o login: {erro}"
         ) from erro
 
-    validar_http(resposta)
+    try:
+        validar_http(resposta)
+    except ErroHTTP500Temporario as erro:
+        # Um 500 durante LOGIN nao e problema de filtro de auditoria.
+        # Nao acionar o fallback de particoes nesse caso.
+        raise ErroServidorTemporario(
+            "IILEX respondeu HTTP 500 durante o login. "
+            "Fallback de filtros desabilitado."
+        ) from erro
 
     try:
         dados = resposta.json()
@@ -527,7 +554,12 @@ class AuditoriaIILEX:
                 return total, resultados
             except ErroServidorTemporario as erro:
                 if tentativa >= MAX_TENTATIVAS_HTTP_TEMPORARIO:
-                    raise ErroServidorPersistente(
+                    classe_persistente = (
+                        ErroHTTP500Persistente
+                        if isinstance(erro, ErroHTTP500Temporario)
+                        else ErroServidorPersistente
+                    )
+                    raise classe_persistente(
                         f"IILEX indisponivel apos {tentativa} tentativa(s) "
                         f"com intervalo de {PAUSA_HTTP_TEMPORARIO}s: {erro}"
                     ) from erro
@@ -937,11 +969,112 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
     return datas, adiados, motivos
 
 
+class ConsultasFallbackLimitadas:
+    """Impede que divisoes sucessivas produzam trafego ilimitado no IILEX."""
+    def __init__(self, auditoria, limite=MAX_CONSULTAS_FALLBACK):
+        self.auditoria = auditoria
+        self.limite = limite
+        self.usadas = 0
+
+    def consultar(self, *args, **kwargs):
+        if self.usadas >= self.limite:
+            raise ErroServidorPersistente(
+                f"Fallback abortado: limite de {self.limite} consultas "
+                "logicas atingido. Dia segue pendente."
+            )
+        self.usadas += 1
+        return self.auditoria.consultar(*args, **kwargs)
+
+
+def coletar_por_particoes_apos_http500(auditoria, usuarios, dia):
+    """Alternativa ao total global indisponivel, sem descartar logs.
+
+    Consulta TODOS os usuarios duas vezes em particoes DIFERENTES:
+    primeira metade / segunda metade e usuarios alternados. As respostas
+    devem ter o mesmo MULTICONJUNTO de registros brutos (Counter, nao set),
+    incluindo suas multiplicidades. As duas metades de cada particao nao
+    podem devolver o mesmo registro bruto (sobreposicao de filtros).
+
+    Se 5xx, 429, limite de trafego ou qualquer inconsistencia ocorrer,
+    a data fica pendente. Nenhum dado e gravado a partir de lote parcial.
+    """
+    if len(usuarios) < 4:
+        raise ErroServidorPersistente(
+            "HTTP 500 no filtro global e menos de 4 usuarios; "
+            "nao ha particoes independentes suficientes para validar."
+        )
+    ids = [str(u['id']) for u in usuarios]
+    if len(set(ids)) != len(ids):
+        raise DivergenciaAuditoria("IDs de usuarios repetidos no fallback.")
+
+    auditoria_limitada = ConsultasFallbackLimitadas(auditoria)
+    meio = len(usuarios) // 2
+    particoes = (
+        (usuarios[:meio], usuarios[meio:]),
+        (usuarios[::2], usuarios[1::2]),
+    )
+    contagem_referencia = None
+    registros_referencia = None
+    for rodada, (esquerda, direita) in enumerate(particoes, 1):
+        print(
+            f"FALLBACK HTTP 500 | particao {rodada}/2 | "
+            f"grupos de {len(esquerda)} e {len(direita)} usuario(s)",
+            flush=True,
+        )
+        re, te = coletar_grupo(auditoria_limitada, dia, esquerda)
+        rd, td = coletar_grupo(auditoria_limitada, dia, direita)
+        ce = Counter(map(canonicalizar, re))
+        cd = Counter(map(canonicalizar, rd))
+        sobrepostos = sum((ce & cd).values())
+        if sobrepostos:
+            raise DivergenciaAuditoria(
+                f"Fallback recusado: {sobrepostos} registros brutos "
+                f"apareceram em ambos os subgrupos da particao {rodada}."
+            )
+        combinado = ce + cd
+        if sum(combinado.values()) != te + td:
+            raise DivergenciaAuditoria(
+                "Fallback recusado: soma dos registros coletados "
+                "diverge dos totais dos subgrupos."
+            )
+        if contagem_referencia is None:
+            contagem_referencia = combinado
+            registros_referencia = re + rd
+        elif combinado != contagem_referencia:
+            faltando = sum((contagem_referencia - combinado).values())
+            sobrando = sum((combinado - contagem_referencia).values())
+            raise DivergenciaAuditoria(
+                "Fallback recusado: particoes independentes discordam "
+                f"(ausentes={faltando}, extras={sobrando}). "
+                "Dia permanece pendente sem gravacao."
+            )
+    print(
+        "FALLBACK VALIDADO: duas particoes independentes conferidas; "
+        f"{len(registros_referencia)} logs; "
+        f"{auditoria_limitada.usadas} consultas logicas adicionais.",
+        flush=True,
+    )
+    # So usar esta anotacao DEPOIS de confirmar os dois conjuntos.
+    setattr(auditoria, "coleta_por_particoes", True)
+    return registros_referencia, len(registros_referencia)
+
+
 def coletar_dia_com_retencao_de_erros(auditoria, usuarios, dia):
     """Refaz a coleta integral se a conferencia de um grupo for inconsistente."""
     for tentativa in range(1, TENTATIVAS_COLETA_DIA + 1):
         try:
-            registros, total = coletar_grupo(auditoria, dia, usuarios)
+            try:
+                registros, total = coletar_grupo(auditoria, dia, usuarios)
+            except ErroHTTP500Persistente as erro:
+                print(
+                    f"ALERTA dia {dia}: HTTP 500 persistente na consulta global. "
+                    "Tentando duas particoes independentes com trafego limitado. "
+                    f"Detalhe: {erro}",
+                    flush=True,
+                )
+                registros, total = coletar_por_particoes_apos_http500(
+                    auditoria, usuarios, dia
+                )
             if len(registros) != total:
                 raise DivergenciaAuditoria(
                     f"Coleta incompleta: total={total}; recebidos={len(registros)}"
@@ -992,6 +1125,7 @@ def validar_filtro_dia_unico(auditoria, usuarios):
 
 def processar_dia(sb, auditoria, usuarios, dia, inicio_ocorrencia, gravar):
     print(f"\n===== {dia} | {'GRAVAÇÃO' if gravar else 'SIMULAÇÃO'} =====", flush=True)
+    setattr(auditoria, "coleta_por_particoes", False)
     iniciado = agora_utc()
     total = 0
     if gravar:
@@ -1025,9 +1159,15 @@ def processar_dia(sb, auditoria, usuarios, dia, inicio_ocorrencia, gravar):
             raise RuntimeError(
                 f"Conferencia pos-gravacao falhou: esperado {total}, encontrado {len(depois)}."
             )
+        mensagem_conclusao = (
+            "Carga conferida por duas particoes independentes; "
+            "consulta global retornou HTTP 500."
+            if getattr(auditoria, "coleta_por_particoes", False)
+            else "Carga integral conferida contra o total IILEX."
+        )
         marcar_carga(
             sb, dia, "concluido", total,
-            "Carga integral conferida contra o total IILEX.", iniciado, agora_utc()
+            mensagem_conclusao, iniciado, agora_utc()
         )
         print(f"Dia {dia} CONCLUIDO, {total} logs conferidos.", flush=True)
     except Exception as exc:
