@@ -8,22 +8,15 @@ from html.parser import HTMLParser
 import requests
 from supabase import create_client
 
-# Usa os Repository Secrets que ja existem nas outras automacoes deste repositorio.
-# Para teste local, cred.py continua sendo opcional, mas NUNCA deve ser enviado ao GitHub.
+# Local: cred.py (compatível com seu script). No serviço externo: variáveis de ambiente.
 import os
-user = os.environ.get("IILEX_USERNAME") or os.environ.get("IILEX_USER", "")
-senha = os.environ.get("IILEX_PASSWORD") or os.environ.get("IILEX_SENHA", "")
-url_supabase = os.environ.get("SUPABASE_URL", "")
-token_supabase = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-if not all((user, senha, url_supabase, token_supabase)):
-    try:
-        from cred import user as local_user, senha as local_senha, url_supabase as local_url, token_supabase as local_token
-        user = user or local_user
-        senha = senha or local_senha
-        url_supabase = url_supabase or local_url
-        token_supabase = token_supabase or local_token
-    except ImportError:
-        pass
+try:
+    from cred import user, senha, url_supabase, token_supabase
+except ImportError:
+    user = os.environ.get("IILEX_USER", "")
+    senha = os.environ.get("IILEX_SENHA", "")
+    url_supabase = os.environ.get("SUPABASE_URL", "")
+    token_supabase = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
@@ -223,7 +216,7 @@ def fazer_login(sessao):
 
     if dados.get("sucesso") is not True:
         raise ErroAutenticacao(
-            "Login IILEX não realizado. Verifique usuario, senha e acesso."
+            f"Login não realizado: {dados}"
         )
 
     sessao.headers["Referer"] = (
@@ -715,7 +708,7 @@ def gerar_hash(
 
 # ---- Rotina diária e recuperação (complemento do arquivo recebido) ----
 # O código recebido terminava no início de converter_inteiro().
-# Esta implementacao valida hashes anteriores antes de inserir qualquer registro.
+# Este complemento recompõe a parte faltante e mantém coleta e hashing originais.
 import argparse
 from collections import Counter
 from zoneinfo import ZoneInfo
@@ -945,7 +938,7 @@ def executar():
             raise ValueError("Início maior que o fim.")
         datas = [inicio + timedelta(days=i) for i in range((fim - inicio).days + 1)]
     if not all((user, senha, url_supabase, token_supabase)):
-        raise RuntimeError("Credenciais ausentes: confira os Secrets IILEX_USERNAME, IILEX_PASSWORD, SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.")
+        raise RuntimeError("Credenciais ausentes: use cred.py ou IILEX_USER, IILEX_SENHA, SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no ambiente.")
     sb = create_client(url_supabase, token_supabase)
     print("Validando compatibilidade de hash com 07/10/2026...", flush=True)
     inicio_ocorrencia = detectar_inicio_ocorrencia(sb)
