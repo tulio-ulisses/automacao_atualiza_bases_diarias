@@ -134,7 +134,7 @@ class TestesCredenciais(unittest.TestCase):
         self.assertEqual(carregado["senha"], "senha_github")
         self.assertEqual(carregado["url_supabase"], variaveis["SUPABASE_URL"])
         self.assertEqual(carregado["token_supabase"], variaveis["SUPABASE_SERVICE_ROLE_KEY"])
-        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-recuperacao-automatica-v5-fallback-particoes")
+        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-v7-pendencias-desde-20260601")
 
     def test_credenciais_legadas_continuam_aceitas(self):
         variaveis = {
@@ -151,14 +151,38 @@ class TestesCredenciais(unittest.TestCase):
 
 class TestesPlanejamento(unittest.TestCase):
     def test_sem_dias_antes_da_data_inicial(self):
-        datas, adiados, motivos = mod.planejar_execucao_diaria(date(2026, 10, 5), {})
+        self.assertEqual(mod.INICIO_HISTORICO, date(2026, 6, 1))
+        datas, adiados, motivos = mod.planejar_execucao_diaria(date(2026, 5, 31), {})
         self.assertEqual((datas, adiados, motivos), ([], [], {}))
 
-    def test_ontem_sempre_primeiro(self):
+    def test_data_inicial_01_06_e_inclusiva(self):
+        datas, adiados, motivos = mod.planejar_execucao_diaria(date(2026, 6, 1), {})
+        self.assertEqual(datas, [date(2026, 6, 1)])
+        self.assertEqual(adiados, [])
+        self.assertEqual(motivos[date(2026, 6, 1)], "coleta de ontem")
+
+    def test_nenhuma_data_antes_de_junho_entra_no_planejamento(self):
+        hoje = date(2026, 6, 4)
+        statuses = {"2026-05-29": "erro", "2026-05-31": "erro", "2026-06-02": "concluido"}
+        datas, adiados, _ = mod.planejar_execucao_diaria(hoje, statuses, 7, 7)
+        self.assertEqual(datas, [date(2026, 6, 4), date(2026, 6, 3), date(2026, 6, 1)])
+        self.assertEqual(adiados, [])
+        self.assertTrue(all(d >= date(2026, 6, 1) for d in datas))
+
+    def test_ontem_pendente_entra_primeiro(self):
         ontem = date(2026, 11, 11)
-        d, _, m = mod.planejar_execucao_diaria(ontem, {"2026-11-11": "concluido"}, 1, 0)
+        statuses = {(ontem-timedelta(days=i)).isoformat(): "concluido"
+                    for i in range(1, (ontem - mod.INICIO_HISTORICO).days + 1)}
+        d, _, m = mod.planejar_execucao_diaria(ontem, statuses, 1, 7)
         self.assertEqual(d, [ontem])
         self.assertEqual(m[ontem], "coleta de ontem")
+
+    def test_ontem_concluido_nao_entra_nem_se_rodar_novamente(self):
+        ontem = date(2026, 11, 11)
+        statuses = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                    for i in range((ontem-mod.INICIO_HISTORICO).days+1)}
+        d, adiados, motivos = mod.planejar_execucao_diaria(ontem, statuses)
+        self.assertEqual((d, adiados, motivos), ([], [], {}))
 
     def test_falhas_e_dias_sem_marcador_sao_recuperados(self):
         ontem = date(2026, 10, 12)
@@ -168,19 +192,50 @@ class TestesPlanejamento(unittest.TestCase):
         self.assertEqual(datas[0], ontem)
         self.assertEqual(datas[1], date(2026, 10, 11))
         self.assertEqual(datas[-1], date(2026, 10, 10))
-        self.assertIn(date(2026, 10, 6), datas)
-        self.assertIn(date(2026, 10, 7), datas)
+        self.assertIn(date(2026, 6, 1), datas)
+        self.assertIn(date(2026, 6, 2), datas)
+        self.assertIn(date(2026, 6, 3), adiados)
         self.assertIn(date(2026, 10, 9), adiados)
         self.assertNotIn(date(2026, 10, 8), datas)
         self.assertEqual(motivos[date(2026, 10, 11)], "recuperacao recente")
 
-    def test_revisao_concluidos_ultimos_7_dias(self):
+    def test_concluidos_ultimos_7_dias_nao_sao_reprocessados(self):
         ontem = date(2026, 10, 12)
-        status = {(ontem - timedelta(days=i)).isoformat(): "concluido" for i in range(7)}
+        status = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                  for i in range((ontem - mod.INICIO_HISTORICO).days + 1)}
         datas, adiados, motivos = mod.planejar_execucao_diaria(ontem, status, 7, 0)
-        self.assertEqual(datas, [ontem - timedelta(days=i) for i in range(7)])
+        self.assertEqual(datas, [])
         self.assertEqual(adiados, [])
-        self.assertIn("revisao", motivos[date(2026, 10, 11)])
+        self.assertEqual(motivos, {})
+
+    def test_ontem_concluido_e_dias_anteriores_falhos(self):
+        ontem = date(2026, 10, 12)
+        status = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                  for i in range((ontem - mod.INICIO_HISTORICO).days + 1)}
+        status["2026-10-10"] = "erro"
+        status["2026-10-09"] = "processando"
+        datas, adiados, motivos = mod.planejar_execucao_diaria(ontem, status, 7, 7)
+        self.assertEqual(datas, [date(2026, 10, 9), date(2026, 10, 10)])
+        self.assertEqual(adiados, [])
+        self.assertIn("executado ao final", motivos[date(2026, 10, 10)])
+
+    def test_planejamento_so_ontem_quando_passado_concluido(self):
+        ontem = date(2026, 11, 11)
+        status = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                  for i in range((ontem - mod.INICIO_HISTORICO).days)}
+        datas, adiados, motivos = mod.planejar_execucao_diaria(ontem, status)
+        self.assertEqual(datas, [ontem])
+        self.assertEqual(adiados, [])
+        self.assertEqual(motivos, {ontem: "coleta de ontem"})
+
+    def test_nao_cria_pendencias_artificiais_de_concluidos(self):
+        ontem = date(2026, 10, 12)
+        status = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                  for i in range((ontem - mod.INICIO_HISTORICO).days + 1)}
+        status["2026-10-08"] = "erro"
+        status["2026-10-11"] = "concluido"
+        datas, _, _ = mod.planejar_execucao_diaria(ontem, status, 7, 7)
+        self.assertEqual(datas, [date(2026, 10, 8)])
 
     def test_ler_cargas_com_mais_de_500_linhas(self):
         banco = BancoFalso()
@@ -207,7 +262,7 @@ class TestesFalhasIsoladas(unittest.TestCase):
         )
         self.assertEqual(datas[0], ontem)
         self.assertLess(datas.index(date(2026, 11, 8)), datas.index(date(2026, 11, 9)))
-        self.assertLess(datas.index(date(2026, 11, 10)), datas.index(date(2026, 11, 9)))
+        self.assertNotIn(date(2026, 11, 10), datas)  # concluido: nao revisitar
         self.assertIn("executado ao final", motivos[date(2026, 11, 9)])
         self.assertIn(date(2026, 11, 9), datas)
 
@@ -535,7 +590,8 @@ class TestesExecucaoResiliente(unittest.TestCase):
         executados = self._rodar(statuses, {date(2026,11,9)}, janela=5)
         self.assertEqual(executados[0], date(2026,11,11))
         self.assertIn(date(2026,11,8), executados)
-        self.assertIn(date(2026,11,7), executados)
+        self.assertNotIn(date(2026,11,7), executados)  # concluido
+        self.assertNotIn(date(2026,11,10), executados) # concluido
         self.assertEqual(executados[-1], date(2026,11,9))
 
     def test_dois_dias_500_abrem_circuit_breaker_e_poupam_servidor(self):
@@ -615,11 +671,14 @@ class TestesFallbackHTTP500(unittest.TestCase):
         with self.assertRaisesRegex(mod.DivergenciaAuditoria, 'apareceram em ambos'):
             mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
 
-    def test_fallback_subgrupo_http500_adiado(self):
+    def test_fallback_subgrupo_http500_recuperado_por_divisao(self):
         eventos = {str(i): [self._evento(i)] for i in range(1,17)}
         aud = self._auditoria(eventos, falhar_subgrupo=True)
-        with self.assertRaises(mod.ErroHTTP500Persistente):
-            mod.coletar_dia_com_retencao_de_erros(aud, self.usuarios, self.dia)
+        registros, total = mod.coletar_dia_com_retencao_de_erros(
+            aud, self.usuarios, self.dia)
+        self.assertEqual((len(registros), total), (16,16))
+        self.assertTrue(aud.coleta_por_particoes)
+        self.assertTrue(any(len(ids)==4 for ids in aud.calls))
 
     def test_timeout_nao_ativa_particoes(self):
         aud = self._auditoria({}, erro_global=mod.ErroServidorPersistente('timeout'))
@@ -678,3 +737,144 @@ class TestesSegurancaExtraV5(unittest.TestCase):
             mod.processar_dia(banco, aud, modelo.usuarios, modelo.dia, 1, True)
         self.assertEqual(len(banco.dados[mod.TABELA_LOGS]),0)
         self.assertEqual(banco.dados[mod.TABELA_CARGAS][0]['status'], 'erro')
+
+
+class TestesFallbackRecursivoV6(unittest.TestCase):
+    """Reproduz especificamente o novo erro: o grupo de 8 retorna HTTP 500."""
+    def setUp(self):
+        self.dia = date(2026, 11, 9)
+        self.usuarios = [{"id": str(i), "nome": f"Pessoa {i}"} for i in range(1,17)]
+        self.eventos = {str(i): [
+            {"id": f"registro-{i}", "usuario": str(i),
+             "data_evento": "2026-11-09 12:00:00"}
+        ] for i in range(1,17)}
+
+    def _fake(self, error_usuario=None, error_len8=False, overlap=False,
+              error_other=None):
+        eventos = self.eventos
+        all_ids = {str(i) for i in range(1,17)}
+        class Falsa:
+            def __init__(self):
+                self.consultas = []
+            def consultar(self, **kw):
+                ids = [str(u["id"]) for u in kw.get("usuarios",[])]
+                self.consultas.append(ids)
+                if error_other and (set(ids)==all_ids):
+                    raise error_other
+                if set(ids)==all_ids or (error_len8 and len(ids)==8) or (
+                    error_usuario and str(error_usuario) in ids
+                ):
+                    raise mod.ErroHTTP500Persistente("IILEX 500")
+                regs = [r for id_ in ids for r in eventos.get(id_, [])]
+                if overlap:
+                    if "1" in ids or "9" in ids:
+                        regs = regs + [{"id":"overlap","data_evento":"2026-11-09 12:00:00"}]
+                return len(regs), regs
+        return Falsa()
+
+    def test_subgrupo_8_http500_com_divisao_recupera_dia(self):
+        aud = self._fake(error_len8=True)
+        regs, total = mod.coletar_dia_com_retencao_de_erros(
+            aud,self.usuarios,self.dia)
+        self.assertEqual(len(regs),16)
+        self.assertEqual(total,16)
+        self.assertTrue(aud.coleta_por_particoes)
+        self.assertTrue(any(len(ids)==4 for ids in aud.consultas))
+        self.assertLessEqual(len(aud.consultas)-1,mod.MAX_CONSULTAS_FALLBACK)
+
+    def test_um_usuario_http500_e_identificado_sem_gravar_parcial(self):
+        aud = self._fake(error_usuario="15")
+        banco = BancoFalso()
+        with self.assertRaisesRegex(mod.ErroServidorPersistente,
+                                    r"Pessoa 15.*id=15.*dia pendente"):
+            mod.processar_dia(banco,aud,self.usuarios,self.dia,1,True)
+        self.assertEqual(len(banco.dados[mod.TABELA_LOGS]),0)
+        self.assertEqual(banco.dados[mod.TABELA_CARGAS][0]['status'],'erro')
+        self.assertTrue(any(ids==['15'] for ids in aud.consultas))
+
+    def test_403_429_nao_ativam_divisao(self):
+        for exc in (mod.ErroAutenticacao("403"),mod.ErroServidor("429")):
+            aud = self._fake(error_other=exc)
+            with self.assertRaises(type(exc)):
+                mod.coletar_dia_com_retencao_de_erros(
+                    aud,self.usuarios,self.dia)
+            self.assertEqual(len(aud.consultas),1)
+
+    def test_limite_se_aplica_a_subdivisoes_recursivas(self):
+        aud = self._fake(error_len8=True)
+        limitado = mod.ConsultasFallbackLimitadas(aud, limite=2)
+        with self.assertRaisesRegex(mod.ErroServidorPersistente,'limite de 2'):
+            mod.coletar_grupo(limitado,self.dia,self.usuarios[:8],
+                              subdividir_http500=True)
+        self.assertEqual(len(aud.consultas),2)
+
+    def test_sobreposicao_em_subgrupos_recursivos_bloqueia(self):
+        aud = self._fake(error_len8=True, overlap=True)
+        with self.assertRaisesRegex(mod.DivergenciaAuditoria,'apareceram em ambos|sobreposto'):
+            mod.coletar_dia_com_retencao_de_erros(
+                aud,self.usuarios,self.dia)
+
+    def test_somente_http500_persistente_subdivide(self):
+        class Falsa:
+            calls=0
+            def consultar(self, **kw):
+                self.calls+=1
+                raise mod.ErroServidorPersistente('timeout')
+        aud=Falsa()
+        with self.assertRaises(mod.ErroServidorPersistente):
+            mod.coletar_grupo(aud,self.dia,self.usuarios[:8],
+                              subdividir_http500=True)
+        self.assertEqual(aud.calls,1)
+
+    def test_verificacao_independente_usa_multiconjuntos(self):
+        # Uma duplicata de payload legitima nao pode sumir na contagem.
+        self.eventos['1'].append(dict(self.eventos['1'][0]))
+        aud=self._fake(error_len8=True)
+        regs,total=mod.coletar_dia_com_retencao_de_erros(
+            aud,self.usuarios,self.dia)
+        self.assertEqual((len(regs),total),(17,17))
+        self.assertEqual(Counter(mod.canonicalizar(r) for r in regs)[
+            mod.canonicalizar(self.eventos['1'][0])],2)
+
+
+class TestesRotinaSomentePendencias(unittest.TestCase):
+    def test_sem_pendencias_nao_acessa_iilex_nem_refaz_hash(self):
+        from datetime import datetime as _datetime
+        ontem = date(2026, 11, 11)
+        status = {(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                  for i in range((ontem - mod.INICIO_HISTORICO).days + 1)}
+        with (
+            patch.object(mod, "datetime") as dt,
+            patch.object(mod, "create_client", return_value=BancoFalso()),
+            patch.multiple(mod, user="teste", senha="teste", url_supabase="https://example.supabase.co", token_supabase="fake"),
+            patch.object(mod, "ler_status_cargas", return_value=status),
+            patch.object(mod, "detectar_inicio_ocorrencia") as hashes,
+            patch.object(mod, "carregar_usuarios") as usuarios,
+            patch.object(mod, "validar_filtro_dia_unico") as preflight,
+            patch.object(mod, "processar_dia") as processar,
+            patch.object(sys, "argv", ["script", "--modo", "diario", "--gravar"]),
+        ):
+            dt.now.return_value = _datetime(2026, 11, 12, 10, 0, tzinfo=mod.FUSO)
+            mod.executar()
+            hashes.assert_not_called()
+            usuarios.assert_not_called()
+            preflight.assert_not_called()
+            processar.assert_not_called()
+
+    def test_recuperacao_manual_ainda_permite_reconsultar_concluido(self):
+        from datetime import datetime as _datetime
+        dia = date(2026, 11, 10)
+        with (
+            patch.object(mod, "datetime") as dt,
+            patch.object(mod, "create_client", return_value=BancoFalso()),
+            patch.multiple(mod, user="teste", senha="teste", url_supabase="https://example.supabase.co", token_supabase="fake"),
+            patch.object(mod, "detectar_inicio_ocorrencia", return_value=1),
+            patch.object(mod, "carregar_usuarios", return_value=[{"id": "1", "nome": "Ana"}]),
+            patch.object(mod, "validar_filtro_dia_unico"),
+            patch.object(mod, "processar_dia") as processar,
+            patch.object(sys, "argv", ["script", "--modo", "recuperar", "--inicio", dia.isoformat(), "--fim", dia.isoformat(), "--gravar"]),
+        ):
+            dt.now.return_value = _datetime(2026, 11, 12, 10, 0, tzinfo=mod.FUSO)
+            mod.executar()
+            self.assertEqual(processar.call_count, 1)
+            self.assertEqual(processar.call_args.args[3], dia)

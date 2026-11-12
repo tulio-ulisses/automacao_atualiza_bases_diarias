@@ -26,7 +26,7 @@ if not all((user, senha, url_supabase, token_supabase)):
         pass
 
 
-VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v5-fallback-particoes"
+VERSAO_SCRIPT = "2026-11-12-v7-pendencias-desde-20260601"
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
 
@@ -37,8 +37,9 @@ URL_PAGINA_AUDITORIA = f"{BASE_URL}/modulos/filtroauditoria"
 TABELA_LOGS = "logs_auditoria_raw"
 TABELA_CARGAS = "logs_auditoria_cargas"
 
-# O modo diario revisa automaticamente pendencias e dias recentes.
-INICIO_HISTORICO = date(2026, 10, 6)
+# O modo diario consulta APENAS datas ainda nao concluidas.
+# A janela serve somente para PRIORIZAR pendencias recentes, sem revisitar concluidos.
+INICIO_HISTORICO = date(2026, 6, 1)
 JANELA_REVISAO_PADRAO = 7
 MAX_PENDENTES_PADRAO = 7
 TENTATIVAS_COLETA_DIA = 2
@@ -51,8 +52,8 @@ PAUSA_HTTP_TEMPORARIO = 120
 # o restante da execucao para proteger o servidor IILEX.
 MAX_DIAS_ERRO_SERVIDOR = 2
 
-# Fallback para HTTP 500 exclusivo da consulta de 16 usuarios.
-# Limite de consultas logicas; cada uma admite no maximo 2 chamadas HTTP.
+# Fallback somente apos HTTP 500 persistente no endpoint de auditoria.
+# Limite GLOBAL por dia de consultas logicas; cada uma permite ate 2 chamadas HTTP.
 MAX_CONSULTAS_FALLBACK = 16
 
 LIMITE_REQUISICAO = 1000
@@ -593,19 +594,76 @@ def nome_grupo(
     )
 
 
-def coletar_grupo(auditoria, data_referencia, usuarios, nivel=0):
-    """Coleta todos os registros, dividindo grupos que ultrapassam 1.000.
+def coletar_grupo(auditoria, data_referencia, usuarios, nivel=0,
+                 subdividir_http500=False):
+    """Coleta logs completos, dividindo grupos acima de 1.000.
 
-    Quando o total do pai difere da soma dos filhos, valida novamente o pai.
-    NUNCA aceita uma divergencia persistente nem descarta registros.
+    No fallback (e APENAS nele), um HTTP 500 persistente num subgrupo
+    provoca sua subdivisao em dois grupos menores. O limite de requisicoes
+    vale para todas as consultas do fallback. Se o erro atingir um unico
+    usuario, a data fica pendente e o usuario problemático e identificado.
+    A ausencia de total do pai exige dupla validacao por particoes distintas.
     """
     indentacao = "    " * nivel
-    total, resultados = auditoria.consultar(
-        data_referencia=data_referencia,
-        usuarios=usuarios,
-        limite=LIMITE_REQUISICAO,
-        descricao=f"grupo com {len(usuarios)} usuário(s)",
-    )
+    if not usuarios:
+        raise DivergenciaAuditoria("Filtro de usuarios vazio: coleta abortada.")
+    try:
+        total, resultados = auditoria.consultar(
+            data_referencia=data_referencia,
+            usuarios=usuarios,
+            limite=LIMITE_REQUISICAO,
+            descricao=f"grupo com {len(usuarios)} usuário(s)",
+        )
+    except ErroHTTP500Persistente as erro:
+        if not subdividir_http500:
+            raise
+        if len(usuarios) == 1:
+            # Nao ha como garantir que esse usuario tenha 0 logs, portanto
+            # NUNCA ignora-lo ou gravar uma coleta parcial.
+            usuario = usuarios[0]
+            mensagem = (
+                f"DIAGNOSTICO HTTP 500: usuario '{usuario['nome']}' "
+                f"(id={usuario['id']}) falhou mesmo isolado em {data_referencia}; "
+                "dia pendente sem gravacao. Abrir incidente no IILEX."
+            )
+            print(f"{indentacao}{mensagem}", flush=True)
+            raise ErroServidorPersistente(mensagem) from erro
+        meio = len(usuarios) // 2
+        esquerda, direita = usuarios[:meio], usuarios[meio:]
+        print(
+            f"{indentacao}FALLBACK RECURSIVO HTTP 500: "
+            f"grupo de {len(usuarios)} usuarios falhou; "
+            f"subdividindo em {len(esquerda)} + {len(direita)}. "
+            f"IDs={[str(item['id']) for item in usuarios]}",
+            flush=True,
+        )
+        re, te = coletar_grupo(
+            auditoria, data_referencia, esquerda, nivel + 1, True
+        )
+        rd, td = coletar_grupo(
+            auditoria, data_referencia, direita, nivel + 1, True
+        )
+        if len(re) != te or len(rd) != td:
+            raise DivergenciaAuditoria(
+                "Fallback HTTP 500: quantidade recebida difere do total de um subgrupo."
+            )
+        # Uma mesma entrada bruta em usuarios distintos e ambigua, e nao
+        # pode ser aceita sem o contador do grupo-pai.
+        sobrepostos = sum((
+            Counter(map(canonicalizar, re)) & Counter(map(canonicalizar, rd))
+        ).values())
+        if sobrepostos:
+            raise DivergenciaAuditoria(
+                f"Fallback HTTP 500: {sobrepostos} registro(s) sobreposto(s) "
+                "entre subgrupos. Coleta nao e confiavel."
+            )
+        print(
+            f"{indentacao}FALLBACK RECURSIVO: grupos menores completos; "
+            f"{te + td} registro(s), sem sobreposicao.",
+            flush=True,
+        )
+        return re + rd, te + td
+
     print(f"{indentacao}{nome_grupo(usuarios)} | total={total}", flush=True)
 
     if total < 0:
@@ -635,10 +693,10 @@ def coletar_grupo(auditoria, data_referencia, usuarios, nivel=0):
     meio = len(usuarios) // 2
     esquerda, direita = usuarios[:meio], usuarios[meio:]
     registros_esquerda, total_esquerda = coletar_grupo(
-        auditoria, data_referencia, esquerda, nivel + 1
+        auditoria, data_referencia, esquerda, nivel + 1, subdividir_http500
     )
     registros_direita, total_direita = coletar_grupo(
-        auditoria, data_referencia, direita, nivel + 1
+        auditoria, data_referencia, direita, nivel + 1, subdividir_http500
     )
     total_filhos = total_esquerda + total_direita
     if len(registros_esquerda) + len(registros_direita) != total_filhos:
@@ -912,9 +970,10 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
                             max_pendentes=MAX_PENDENTES_PADRAO):
     """Retorna (datas, pendentes_adiados, motivos) sem consultar o IILEX.
 
-    Ordem: ontem, pendencias da janela recente, pendencias historicas mais
-    antigas (limitadas), revisao dos concluidos recentes. Todo dia nao
-    concluido, ausente na tabela ou 'processando' entra como pendente.
+    Ordem: ontem (caso pendente), pendencias da janela recente,
+    pendencias historicas mais antigas (limitadas). Datas ja concluidas
+    nunca sao reconsultadas automaticamente, nem mesmo ontem.
+    Datas sem controle ou com status diferente de 'concluido' sao pendentes.
     """
     if janela_revisao < 0 or max_pendentes < 0:
         raise ValueError("janela_revisao e max_pendentes devem ser >= 0")
@@ -929,9 +988,10 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
     def concluido(dia):
         return statuses.get(dia.isoformat()) == "concluido"
 
-    # O ontem entra obrigatoriamente, mesmo se houver registro concluido.
-    datas = [ontem]
-    motivos = {ontem: "coleta de ontem"}
+    # Ontem so entra se ainda NAO estiver concluido. Isso evita repetir
+    # uma carga em novas execucoes do mesmo dia.
+    datas = [ontem] if not concluido(ontem) else []
+    motivos = {ontem: "coleta de ontem"} if datas else {}
     recentes_pendentes = sorted(
         [d for d in recentes if d != ontem and not concluido(d)], reverse=True
     )
@@ -949,21 +1009,16 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
     for dia in escolhidos_historicos:
         datas.append(dia)
         motivos[dia] = "recuperacao historica"
-    for dia in sorted(recentes, reverse=True):
-        if dia != ontem and concluido(dia):
-            datas.append(dia)
-            motivos[dia] = "revisao de 7 dias" if janela_revisao == 7 else "revisao recente"
-
     # Datas que falharam antes vao para o FIM: um dia com 5xx recorrente
     # nao bloqueia o processamento de datas novas ou sem erro anterior.
     # 'ontem' mantem sempre prioridade maxima.
     sem_erro_anterior = [
-        d for d in datas[1:] if statuses.get(d.isoformat()) != "erro"
+        d for d in datas if d != ontem and statuses.get(d.isoformat()) != "erro"
     ]
     com_erro_anterior = [
-        d for d in datas[1:] if statuses.get(d.isoformat()) == "erro"
+        d for d in datas if d != ontem and statuses.get(d.isoformat()) == "erro"
     ]
-    datas = [ontem] + sem_erro_anterior + com_erro_anterior
+    datas = ([ontem] if ontem in datas else []) + sem_erro_anterior + com_erro_anterior
     for dia in com_erro_anterior:
         motivos[dia] += " (tentativa anterior falhou; executado ao final)"
     return datas, adiados, motivos
@@ -995,8 +1050,9 @@ def coletar_por_particoes_apos_http500(auditoria, usuarios, dia):
     incluindo suas multiplicidades. As duas metades de cada particao nao
     podem devolver o mesmo registro bruto (sobreposicao de filtros).
 
-    Se 5xx, 429, limite de trafego ou qualquer inconsistencia ocorrer,
-    a data fica pendente. Nenhum dado e gravado a partir de lote parcial.
+    Subgrupos que retornarem HTTP 500 podem ser subdivididos ate um usuario.
+    Um usuario com HTTP 500 individual, um 429, um limite de consultas, ou
+    qualquer inconsistencia deixa o dia pendente sem gravacao parcial.
     """
     if len(usuarios) < 4:
         raise ErroServidorPersistente(
@@ -1021,8 +1077,8 @@ def coletar_por_particoes_apos_http500(auditoria, usuarios, dia):
             f"grupos de {len(esquerda)} e {len(direita)} usuario(s)",
             flush=True,
         )
-        re, te = coletar_grupo(auditoria_limitada, dia, esquerda)
-        rd, td = coletar_grupo(auditoria_limitada, dia, direita)
+        re, te = coletar_grupo(auditoria_limitada, dia, esquerda, subdividir_http500=True)
+        rd, td = coletar_grupo(auditoria_limitada, dia, direita, subdividir_http500=True)
         ce = Counter(map(canonicalizar, re))
         cd = Counter(map(canonicalizar, rd))
         sobrepostos = sum((ce & cd).values())
@@ -1193,7 +1249,7 @@ def executar():
     parser.add_argument("--gravar", action="store_true",
                         help="Escreve no Supabase; sem esta flag apenas compara")
     parser.add_argument("--janela-revisao", type=int, default=JANELA_REVISAO_PADRAO,
-                        help="Quantidade de dias recentes para revalidar (padrao: 7)")
+                        help="Janela de prioridade para pendencias recentes, sem revisitar concluidos (padrao: 7)")
     parser.add_argument("--max-pendentes", type=int, default=MAX_PENDENTES_PADRAO,
                         help="Limite de pendencias historicas por execucao (padrao: 7)")
     args = parser.parse_args()
@@ -1220,9 +1276,6 @@ def executar():
             "Credenciais ausentes: confira os Repository Secrets ou cred.py local."
         )
     sb = create_client(url_supabase, token_supabase)
-    print("Validando compatibilidade de hash com 07/10/2026...", flush=True)
-    inicio_ocorrencia = detectar_inicio_ocorrencia(sb)
-    print(f"Compatibilidade OK. Ocorrencias comecam em {inicio_ocorrencia}.", flush=True)
 
     adiados = []
     motivos = {}
@@ -1238,9 +1291,16 @@ def executar():
         )
         for d in datas:
             print(f"  - {d}: {motivos[d]}", flush=True)
+        if not datas:
+            print("Todas as datas ate ontem estao concluidas. Nenhuma consulta ao IILEX necessaria.", flush=True)
+            return
     else:
         print(f"Recuperacao manual: {datas[0]} ate {datas[-1]}", flush=True)
 
+    # Evita checagens e consultas externas quando nao ha qualquer carga pendente.
+    print("Validando compatibilidade de hash com 07/10/2026...", flush=True)
+    inicio_ocorrencia = detectar_inicio_ocorrencia(sb)
+    print(f"Compatibilidade OK. Ocorrencias comecam em {inicio_ocorrencia}.", flush=True)
     usuarios = carregar_usuarios()
     print(f"{len(usuarios)} usuarios IILEX.", flush=True)
     auditoria = AuditoriaIILEX()
