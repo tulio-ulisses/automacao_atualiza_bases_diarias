@@ -134,7 +134,7 @@ class TestesCredenciais(unittest.TestCase):
         self.assertEqual(carregado["senha"], "senha_github")
         self.assertEqual(carregado["url_supabase"], variaveis["SUPABASE_URL"])
         self.assertEqual(carregado["token_supabase"], variaveis["SUPABASE_SERVICE_ROLE_KEY"])
-        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-recuperacao-automatica-v3-intervalo-http500")
+        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-recuperacao-automatica-v4-falhas-isoladas")
 
     def test_credenciais_legadas_continuam_aceitas(self):
         variaveis = {
@@ -166,7 +166,8 @@ class TestesPlanejamento(unittest.TestCase):
                   "2026-10-08": "concluido"}
         datas, adiados, motivos = mod.planejar_execucao_diaria(ontem, status, 3, 2)
         self.assertEqual(datas[0], ontem)
-        self.assertEqual(datas[1:3], [date(2026, 10, 11), date(2026, 10, 10)])
+        self.assertEqual(datas[1], date(2026, 10, 11))
+        self.assertEqual(datas[-1], date(2026, 10, 10))
         self.assertIn(date(2026, 10, 6), datas)
         self.assertIn(date(2026, 10, 7), datas)
         self.assertIn(date(2026, 10, 9), adiados)
@@ -190,6 +191,62 @@ class TestesPlanejamento(unittest.TestCase):
         statuses = mod.ler_status_cargas(banco, fim)
         self.assertEqual(len(statuses), 600)
         self.assertEqual(statuses[fim.isoformat()], "concluido")
+
+
+class TestesFalhasIsoladas(unittest.TestCase):
+    def test_pendencia_erro_ao_final_sem_perder_pendencia(self):
+        ontem = date(2026, 11, 11)
+        statuses = {
+            "2026-11-10": "concluido",
+            "2026-11-09": "erro",
+            "2026-11-08": "processando",
+            "2026-11-07": "concluido",
+        }
+        datas, adiados, motivos = mod.planejar_execucao_diaria(
+            ontem, statuses, janela_revisao=7, max_pendentes=3,
+        )
+        self.assertEqual(datas[0], ontem)
+        self.assertLess(datas.index(date(2026, 11, 8)), datas.index(date(2026, 11, 9)))
+        self.assertLess(datas.index(date(2026, 11, 10)), datas.index(date(2026, 11, 9)))
+        self.assertIn("executado ao final", motivos[date(2026, 11, 9)])
+        self.assertIn(date(2026, 11, 9), datas)
+
+    def test_500_persistente_e_classificado_sem_repeticao_infinita(self):
+        s1, s2 = Mock(), Mock()
+        s1.post.return_value = Mock(status_code=500)
+        s2.post.return_value = Mock(status_code=500)
+        a = mod.AuditoriaIILEX()
+        with (patch.object(mod, "criar_sessao_http", side_effect=[s1, s2]),
+              patch.object(mod, "fazer_login"),
+              patch.object(mod.time, "sleep") as dormir):
+            with self.assertRaises(mod.ErroServidorPersistente):
+                a.consultar(date(2026, 11, 9))
+        self.assertEqual(a.numero_consultas, 2)
+        self.assertEqual(s1.post.call_count, 1)
+        self.assertEqual(s2.post.call_count, 1)
+        self.assertTrue(any(c.args == (120,) for c in dormir.call_args_list))
+
+    def test_429_nao_e_erro_servidor_persistente(self):
+        with self.assertRaises(mod.ErroServidor) as cm:
+            mod.validar_http(Mock(status_code=429))
+        self.assertNotIsInstance(cm.exception, mod.ErroServidorPersistente)
+
+    def test_500_marca_dia_sem_alterar_logs(self):
+        banco = BancoFalso()
+        a = AuditoriaFalsa([])
+        def raise_persistente(**kwargs):
+            raise mod.ErroServidorPersistente("HTTP 500 persistente")
+        a.consultar = raise_persistente
+        with self.assertRaises(mod.ErroServidorPersistente):
+            mod.processar_dia(
+                banco, a, [{"id": "1", "nome": "Ana"}],
+                date(2026, 11, 9), 1, True,
+            )
+        self.assertEqual(banco.dados[mod.TABELA_LOGS], [])
+        self.assertEqual(banco.dados[mod.TABELA_CARGAS][0]["status"], "erro")
+
+    def test_erro_temporario_nao_e_erro_de_auth(self):
+        self.assertFalse(issubclass(mod.ErroServidorPersistente, mod.ErroAutenticacao))
 
 
 class TestesIntegridadeColeta(unittest.TestCase):
@@ -442,3 +499,49 @@ class TestesDataEHTTP(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# Testes de orquestracao: nenhum IILEX/Supabase real eh acionado.
+class TestesExecucaoResiliente(unittest.TestCase):
+    def _rodar(self, statuses, falhas, janela=5):
+        from datetime import datetime
+        executados = []
+        def executar_dia(sb, auditoria, usuarios, dia, inicio_ocorrencia, gravar):
+            executados.append(dia)
+            if dia in falhas:
+                raise mod.ErroServidorPersistente("HTTP 500 apos duas tentativas")
+        with (
+            patch.object(mod, "datetime") as dt,
+            patch.object(mod, "create_client", return_value=BancoFalso()),
+            patch.multiple(mod, user="teste", senha="teste", url_supabase="https://example.supabase.co", token_supabase="fake"),
+            patch.object(mod, "detectar_inicio_ocorrencia", return_value=1),
+            patch.object(mod, "ler_status_cargas", return_value=statuses),
+            patch.object(mod, "carregar_usuarios", return_value=[{"id":"1", "nome":"Ana"}]),
+            patch.object(mod, "validar_filtro_dia_unico"),
+            patch.object(mod, "processar_dia", side_effect=executar_dia),
+            patch.object(mod.time, "sleep"),
+            patch.object(sys, "argv", ["script", "--modo", "diario", "--gravar",
+                                      "--janela-revisao", str(janela), "--max-pendentes", "0"]),
+        ):
+            dt.now.return_value = datetime(2026, 11, 12, 8, 0, tzinfo=mod.FUSO)
+            with self.assertRaises(SystemExit) as cm:
+                mod.executar()
+            self.assertEqual(cm.exception.code, 1)
+        return executados
+
+    def test_um_dia_500_nao_impede_conclusao_dos_outros(self):
+        statuses = {"2026-11-10":"concluido", "2026-11-09":"erro",
+                    "2026-11-08":"processando", "2026-11-07":"concluido"}
+        executados = self._rodar(statuses, {date(2026,11,9)}, janela=5)
+        self.assertEqual(executados[0], date(2026,11,11))
+        self.assertIn(date(2026,11,8), executados)
+        self.assertIn(date(2026,11,7), executados)
+        self.assertEqual(executados[-1], date(2026,11,9))
+
+    def test_dois_dias_500_abrem_circuit_breaker_e_poupam_servidor(self):
+        statuses = {"2026-11-10":"concluido", "2026-11-09":"erro",
+                    "2026-11-08":"erro", "2026-11-07":"erro"}
+        executados = self._rodar(statuses, {date(2026,11,9),date(2026,11,8)}, janela=5)
+        self.assertIn(date(2026,11,9), executados)
+        self.assertIn(date(2026,11,8), executados)
+        self.assertNotIn(date(2026,11,7), executados)

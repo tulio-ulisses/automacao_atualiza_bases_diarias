@@ -26,7 +26,7 @@ if not all((user, senha, url_supabase, token_supabase)):
         pass
 
 
-VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v3-intervalo-http500"
+VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v4-falhas-isoladas"
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
 
@@ -47,6 +47,9 @@ RECONSULTAS_TOTAL_PAI = 2
 # com espera longa. 401/403/429 interrompem imediatamente para proteger o IILEX.
 MAX_TENTATIVAS_HTTP_TEMPORARIO = 2
 PAUSA_HTTP_TEMPORARIO = 120
+# Depois de dois dias distintos com HTTP 5xx/timeout persistente, interromper
+# o restante da execucao para proteger o servidor IILEX.
+MAX_DIAS_ERRO_SERVIDOR = 2
 
 LIMITE_REQUISICAO = 1000
 
@@ -68,6 +71,11 @@ class ErroServidor(Exception):
 
 class ErroServidorTemporario(ErroServidor):
     """Erro HTTP 5xx ou de transporte que admite uma nova tentativa limitada."""
+    pass
+
+
+class ErroServidorPersistente(ErroServidor):
+    """5xx/timeout/conexao persistente apos repetir com pausa; dia pendente."""
     pass
 
 
@@ -519,7 +527,7 @@ class AuditoriaIILEX:
                 return total, resultados
             except ErroServidorTemporario as erro:
                 if tentativa >= MAX_TENTATIVAS_HTTP_TEMPORARIO:
-                    raise ErroServidor(
+                    raise ErroServidorPersistente(
                         f"IILEX indisponivel apos {tentativa} tentativa(s) "
                         f"com intervalo de {PAUSA_HTTP_TEMPORARIO}s: {erro}"
                     ) from erro
@@ -914,6 +922,18 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
             datas.append(dia)
             motivos[dia] = "revisao de 7 dias" if janela_revisao == 7 else "revisao recente"
 
+    # Datas que falharam antes vao para o FIM: um dia com 5xx recorrente
+    # nao bloqueia o processamento de datas novas ou sem erro anterior.
+    # 'ontem' mantem sempre prioridade maxima.
+    sem_erro_anterior = [
+        d for d in datas[1:] if statuses.get(d.isoformat()) != "erro"
+    ]
+    com_erro_anterior = [
+        d for d in datas[1:] if statuses.get(d.isoformat()) == "erro"
+    ]
+    datas = [ontem] + sem_erro_anterior + com_erro_anterior
+    for dia in com_erro_anterior:
+        motivos[dia] += " (tentativa anterior falhou; executado ao final)"
     return datas, adiados, motivos
 
 
@@ -1086,11 +1106,31 @@ def executar():
     auditoria = AuditoriaIILEX()
     validar_filtro_dia_unico(auditoria, usuarios)
     erros = []
+    dias_erro_servidor = 0
     for indice, dia in enumerate(datas):
         try:
             processar_dia(sb, auditoria, usuarios, dia, inicio_ocorrencia, args.gravar)
+        except ErroServidorPersistente as exc:
+            # A coleta desse dia foi interrompida antes de inserir qualquer log;
+            # processar_dia ja marcou a data como 'erro' em cargas.
+            print(
+                f"DIA ADIADO {dia}: servidor IILEX indisponivel apos retry. "
+                "Continuara pendente para a proxima execucao.",
+                flush=True,
+            )
+            erros.append((dia.isoformat(), str(exc)))
+            dias_erro_servidor += 1
+            if dias_erro_servidor >= MAX_DIAS_ERRO_SERVIDOR:
+                print(
+                    f"CIRCUIT BREAKER: {dias_erro_servidor} dias com erro "
+                    "de servidor/transporte. Interrompendo para evitar "
+                    "trafego excessivo ao IILEX. Datas nao processadas "
+                    "seguirao pendentes.",
+                    flush=True,
+                )
+                break
         except (ErroAutenticacao, ErroServidor) as exc:
-            # 401/403/429/5xx: parar imediatamente e evitar trafego adicional.
+            # 401/403/429/erros nao classificados: parar imediatamente.
             print(f"FALHA CRITICA em {dia}: {exc}", flush=True)
             raise
         except Exception as exc:
