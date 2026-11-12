@@ -26,7 +26,7 @@ if not all((user, senha, url_supabase, token_supabase)):
         pass
 
 
-VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v2"
+VERSAO_SCRIPT = "2026-11-12-recuperacao-automatica-v3-intervalo-http500"
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
 
@@ -43,6 +43,10 @@ JANELA_REVISAO_PADRAO = 7
 MAX_PENDENTES_PADRAO = 7
 TENTATIVAS_COLETA_DIA = 2
 RECONSULTAS_TOTAL_PAI = 2
+# Apenas falhas temporarias (5xx/timeout/conexao) recebem UMA nova tentativa,
+# com espera longa. 401/403/429 interrompem imediatamente para proteger o IILEX.
+MAX_TENTATIVAS_HTTP_TEMPORARIO = 2
+PAUSA_HTTP_TEMPORARIO = 120
 
 LIMITE_REQUISICAO = 1000
 
@@ -59,6 +63,11 @@ class ErroAutenticacao(Exception):
 
 
 class ErroServidor(Exception):
+    pass
+
+
+class ErroServidorTemporario(ErroServidor):
+    """Erro HTTP 5xx ou de transporte que admite uma nova tentativa limitada."""
     pass
 
 
@@ -171,7 +180,7 @@ def validar_http(resposta):
         )
 
     if resposta.status_code >= 500:
-        raise ErroServidor(
+        raise ErroServidorTemporario(
             f"IILEX respondeu HTTP {resposta.status_code}. "
             "Execução interrompida por segurança."
         )
@@ -214,14 +223,14 @@ def fazer_login(sessao):
         )
 
     except requests.Timeout as erro:
-        raise ErroServidor(
+        raise ErroServidorTemporario(
             f"Timeout durante o login: {erro}"
-        )
+        ) from erro
 
     except requests.RequestException as erro:
-        raise ErroServidor(
+        raise ErroServidorTemporario(
             f"Erro de comunicação durante o login: {erro}"
-        )
+        ) from erro
 
     validar_http(resposta)
 
@@ -305,12 +314,10 @@ def montar_payload(
         "%d/%m/%Y"
     )
 
-    data_ate = (
-        data_referencia
-        + timedelta(days=1)
-    ).strftime(
-        "%d/%m/%Y"
-    )
+    # O filtro dataAte do IILEX inclui o dia informado. Usar o dia
+    # seguinte capturava tambem eventos do dia seguinte (comprovado no
+    # log de 10/11/2026) e deixava totais oscilantes no dia corrente.
+    data_ate = data_referencia.strftime("%d/%m/%Y")
 
     payload = [
         (
@@ -470,80 +477,62 @@ class AuditoriaIILEX:
         limite=1,
         descricao="consulta",
     ):
-        self.aguardar()
+        """Uma consulta logica, com apenas uma repeticao para erro transitorio.
 
-        sessao = criar_sessao_http()
-
-        try:
-            fazer_login(
-                sessao
-            )
-
-            payload = montar_payload(
-                data_referencia=(
-                    data_referencia
-                ),
-                usuarios=usuarios,
-                limite=limite,
-            )
-
-            print()
-            print(
-                f"Auditoria "
-                f"#{self.numero_consultas + 1} "
-                f"| {descricao}"
-            )
-
+        Preserva a pausa de 30s entre requisicoes e aborta 401/403/429
+        imediatamente. A repeticao exige 120s de repouso, inclusive em 5xx.
+        """
+        for tentativa in range(1, MAX_TENTATIVAS_HTTP_TEMPORARIO + 1):
+            self.aguardar()
+            sessao = criar_sessao_http()
             try:
-                resposta = sessao.post(
-                    URL_AUDITORIA,
-                    data=payload,
-                    timeout=90,
+                print(
+                    f"\nAuditoria #{self.numero_consultas + 1} | {descricao} "
+                    f"| HTTP {tentativa}/{MAX_TENTATIVAS_HTTP_TEMPORARIO}",
+                    flush=True,
                 )
-
-            except requests.Timeout as erro:
-                raise ErroServidor(
-                    "Timeout ao consultar IILEX. "
-                    "Execução interrompida. "
-                    f"{erro}"
+                self.numero_consultas += 1
+                fazer_login(sessao)
+                payload = montar_payload(
+                    data_referencia=data_referencia,
+                    usuarios=usuarios,
+                    limite=limite,
                 )
+                try:
+                    resposta = sessao.post(
+                        URL_AUDITORIA,
+                        data=payload,
+                        timeout=90,
+                    )
+                except requests.Timeout as erro:
+                    raise ErroServidorTemporario(
+                        f"Timeout ao consultar IILEX: {erro}"
+                    ) from erro
+                except requests.RequestException as erro:
+                    raise ErroServidorTemporario(
+                        f"Erro de comunicacao com IILEX: {erro}"
+                    ) from erro
 
-            except requests.RequestException as erro:
-                raise ErroServidor(
-                    "Erro de comunicação com IILEX. "
-                    "Execução interrompida. "
-                    f"{erro}"
+                total, resultados = interpretar_resposta(resposta)
+                print(f"Total informado: {total}", flush=True)
+                print(f"Registros recebidos: {len(resultados)}", flush=True)
+                return total, resultados
+            except ErroServidorTemporario as erro:
+                if tentativa >= MAX_TENTATIVAS_HTTP_TEMPORARIO:
+                    raise ErroServidor(
+                        f"IILEX indisponivel apos {tentativa} tentativa(s) "
+                        f"com intervalo de {PAUSA_HTTP_TEMPORARIO}s: {erro}"
+                    ) from erro
+                print(
+                    f"ALERTA: falha temporaria ({erro}). "
+                    f"Aguardando {PAUSA_HTTP_TEMPORARIO}s antes da ultima tentativa.",
+                    flush=True,
                 )
-
-            total, resultados = (
-                interpretar_resposta(
-                    resposta
-                )
-            )
-
-            self.numero_consultas += 1
-
-            print(
-                f"Total informado: "
-                f"{total}"
-            )
-
-            print(
-                f"Registros recebidos: "
-                f"{len(resultados)}"
-            )
-
-            return (
-                total,
-                resultados,
-            )
-
-        finally:
-            self.ultima_consulta = (
-                time.monotonic()
-            )
-
-            sessao.close()
+            finally:
+                self.ultima_consulta = time.monotonic()
+                sessao.close()
+            time.sleep(PAUSA_HTTP_TEMPORARIO)
+        raise AssertionError("Numero de tentativas HTTP invalido")
 
 
 def nome_grupo(
@@ -949,6 +938,38 @@ def coletar_dia_com_retencao_de_erros(auditoria, usuarios, dia):
     raise AssertionError("Inatingivel")
 
 
+def validar_filtro_dia_unico(auditoria, usuarios):
+    """Preflight de leitura: nunca concluir um dia vazio por erro de limite.
+
+    O banco possui logs de 07/10/2026 (validado em
+    detectar_inicio_ocorrencia). Confirmamos que o IILEX devolve pelo
+    menos um evento desse mesmo dia usando dataDe == dataAte.
+    Se a API mudar a semantica, abortamos antes de gravar qualquer carga.
+    """
+    referencia = date(2026, 10, 7)
+    total, resultados = auditoria.consultar(
+        data_referencia=referencia, usuarios=usuarios, limite=1,
+        descricao="preflight: filtro com dataDe == dataAte",
+    )
+    if total <= 0 or len(resultados) != 1:
+        raise RuntimeError(
+            "O filtro de um unico dia nao retornou o evento de referencia "
+            "de 07/10/2026, que existe no Supabase. Possivel semantica "
+            "de dataAte diferente do esperado; bloqueada qualquer gravacao."
+        )
+    try:
+        construir_linha(resultados[0], referencia, "hash-so-validacao")
+    except (ValueError, TypeError) as erro:
+        raise RuntimeError(
+            "IILEX retornou evento fora da data no preflight; "
+            "nenhuma carga sera iniciada."
+        ) from erro
+    print(
+        "Preflight temporal OK: intervalo fechado em um dia e evento de "
+        "07/10/2026 confirmado.", flush=True,
+    )
+
+
 def processar_dia(sb, auditoria, usuarios, dia, inicio_ocorrencia, gravar):
     print(f"\n===== {dia} | {'GRAVAÇÃO' if gravar else 'SIMULAÇÃO'} =====", flush=True)
     iniciado = agora_utc()
@@ -1063,6 +1084,7 @@ def executar():
     usuarios = carregar_usuarios()
     print(f"{len(usuarios)} usuarios IILEX.", flush=True)
     auditoria = AuditoriaIILEX()
+    validar_filtro_dia_unico(auditoria, usuarios)
     erros = []
     for indice, dia in enumerate(datas):
         try:
