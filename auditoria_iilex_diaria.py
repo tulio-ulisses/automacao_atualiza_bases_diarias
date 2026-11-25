@@ -26,7 +26,7 @@ if not all((user, senha, url_supabase, token_supabase)):
         pass
 
 
-VERSAO_SCRIPT = "2026-11-12-v7-pendencias-desde-20260601"
+VERSAO_SCRIPT = "2026-11-25-v8-rotacao-pendencias"
 
 BASE_URL = "https://juscash.iilex.com.br/sistema"
 
@@ -621,6 +621,25 @@ def coletar_grupo(auditoria, data_referencia, usuarios, nivel=0,
             # Nao ha como garantir que esse usuario tenha 0 logs, portanto
             # NUNCA ignora-lo ou gravar uma coleta parcial.
             usuario = usuarios[0]
+            if str(usuario["id"]) == "-":
+                try:
+                    contagem, amostra = auditoria.consultar(
+                        data_referencia=data_referencia, usuarios=usuarios,
+                        limite=1, descricao="diagnostico [Nao informado]: limite 1",
+                    )
+                    if 0 < contagem < LIMITE_REQUISICAO and len(amostra) == 1:
+                        if contagem == 1:
+                            return amostra, 1
+                        total_menor, registros_menores = auditoria.consultar(
+                            data_referencia=data_referencia, usuarios=usuarios,
+                            limite=contagem, descricao="[Nao informado]: limite exato",
+                        )
+                        if (total_menor == contagem == len(registros_menores)
+                                and canonicalizar(amostra[0]) in
+                                {canonicalizar(r) for r in registros_menores}):
+                            return registros_menores, contagem
+                except ErroHTTP500Persistente:
+                    pass  # continua pendente; nunca presume zero logs
             mensagem = (
                 f"DIAGNOSTICO HTTP 500: usuario '{usuario['nome']}' "
                 f"(id={usuario['id']}) falhou mesmo isolado em {data_referencia}; "
@@ -944,14 +963,21 @@ def marcar_carga(sb, dia, status, total, mensagem, iniciado, concluido=None):
     sb.table(TABELA_CARGAS).upsert(dados, on_conflict="data_referencia").execute()
 
 
+class StatusCargas(dict):
+    """Mantem a interface de dict e registra a ultima tentativa de cada dia."""
+    def __init__(self):
+        super().__init__()
+        self.tentativas = {}
+
+
 def ler_status_cargas(sb, ultimo_dia):
     """Busca todos os dias da tabela de controle, com paginacao explicita."""
-    statuses = {}
+    statuses = StatusCargas()
     inicio = 0
     while True:
         pagina = (
             sb.table(TABELA_CARGAS)
-            .select("data_referencia,status")
+            .select("data_referencia,status,iniciado_em")
             .gte("data_referencia", INICIO_HISTORICO.isoformat())
             .lte("data_referencia", ultimo_dia.isoformat())
             .order("data_referencia")
@@ -960,7 +986,18 @@ def ler_status_cargas(sb, ultimo_dia):
         )
         for item in pagina:
             if item.get("data_referencia"):
-                statuses[str(item["data_referencia"])[:10]] = str(item.get("status") or "").lower()
+                chave = str(item["data_referencia"])[:10]
+                statuses[chave] = str(item.get("status") or "").lower()
+                # Postgres retorna timestamp ISO; normalizar para segundos UTC.
+                valor = item.get("iniciado_em")
+                if valor:
+                    try:
+                        instante = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+                        if instante.tzinfo is None:
+                            instante = instante.replace(tzinfo=timezone.utc)
+                        statuses.tentativas[chave] = instante.timestamp()
+                    except (ValueError, TypeError, OverflowError):
+                        pass
         if len(pagina) < 500:
             return statuses
         inicio += 500
@@ -1000,6 +1037,17 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
     )
     # O limite recai apenas sobre as pendencias historicas; recentes jamais
     # sao esquecidos por excesso de backlog antigo.
+    tentativas = getattr(statuses, "tentativas", {})
+
+    def ultima_tentativa(dia):
+        return tentativas.get(dia.isoformat(), float("-inf"))
+
+    if tentativas:
+        # Nao deixar o limite historico selecionar sempre as mesmas datas.
+        # Sem erro anterior primeiro, depois a tentativa mais antiga.
+        historicos_pendentes.sort(key=lambda d: (
+            statuses.get(d.isoformat()) == "erro", ultima_tentativa(d), d
+        ))
     escolhidos_historicos = historicos_pendentes[:max_pendentes]
     adiados = historicos_pendentes[max_pendentes:]
 
@@ -1018,6 +1066,10 @@ def planejar_execucao_diaria(ontem, statuses, janela_revisao=JANELA_REVISAO_PADR
     com_erro_anterior = [
         d for d in datas if d != ontem and statuses.get(d.isoformat()) == "erro"
     ]
+    # O circuit breaker continua existindo, mas a fila de falhas gira a
+    # cada tentativa. Uma data persistentemente ruim nao monopoliza a fila.
+    if tentativas:
+        com_erro_anterior.sort(key=ultima_tentativa)
     datas = ([ontem] if ontem in datas else []) + sem_erro_anterior + com_erro_anterior
     for dia in com_erro_anterior:
         motivos[dia] += " (tentativa anterior falhou; executado ao final)"

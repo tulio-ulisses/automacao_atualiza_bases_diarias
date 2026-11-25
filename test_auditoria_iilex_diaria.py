@@ -134,7 +134,7 @@ class TestesCredenciais(unittest.TestCase):
         self.assertEqual(carregado["senha"], "senha_github")
         self.assertEqual(carregado["url_supabase"], variaveis["SUPABASE_URL"])
         self.assertEqual(carregado["token_supabase"], variaveis["SUPABASE_SERVICE_ROLE_KEY"])
-        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-12-v7-pendencias-desde-20260601")
+        self.assertEqual(carregado["VERSAO_SCRIPT"], "2026-11-25-v8-rotacao-pendencias")
 
     def test_credenciais_legadas_continuam_aceitas(self):
         variaveis = {
@@ -878,3 +878,65 @@ class TestesRotinaSomentePendencias(unittest.TestCase):
             mod.executar()
             self.assertEqual(processar.call_count, 1)
             self.assertEqual(processar.call_args.args[3], dia)
+
+
+class TestesRotacaoV8(unittest.TestCase):
+    def test_fila_gira_sem_reconsultar_concluidos(self):
+        ontem = date(2026, 11, 24)
+        statuses = mod.StatusCargas()
+        statuses.update({(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                         for i in range((ontem - mod.INICIO_HISTORICO).days + 1)})
+        dias = [date(2026, 11, 23), date(2026, 11, 19), date(2026, 6, 27)]
+        for d, timestamp in zip(dias, [30, 20, 10]):
+            statuses[d.isoformat()] = "erro"
+            statuses.tentativas[d.isoformat()] = timestamp
+        plano, _, _ = mod.planejar_execucao_diaria(ontem, statuses)
+        self.assertEqual(plano, dias[::-1])
+        for d in plano[:2]:
+            statuses.tentativas[d.isoformat()] = 40
+        novo_plano, _, _ = mod.planejar_execucao_diaria(ontem, statuses)
+        self.assertEqual(novo_plano[0], dias[0])
+        self.assertNotIn(ontem, novo_plano)
+
+    def test_limite_historico_tambem_gira(self):
+        ontem = date(2026, 11, 24)
+        statuses = mod.StatusCargas()
+        statuses.update({(mod.INICIO_HISTORICO + timedelta(days=i)).isoformat(): "concluido"
+                         for i in range((ontem - mod.INICIO_HISTORICO).days + 1)})
+        a, b = date(2026, 6, 27), date(2026, 7, 6)
+        for d, ts in [(a, 20), (b, 10)]:
+            statuses[d.isoformat()] = "erro"
+            statuses.tentativas[d.isoformat()] = ts
+        plano, adiados, _ = mod.planejar_execucao_diaria(ontem, statuses, 7, 1)
+        self.assertEqual(plano, [b])
+        self.assertEqual(adiados, [a])
+
+    def test_leitura_da_ultima_tentativa(self):
+        banco = BancoFalso()
+        banco.dados[mod.TABELA_CARGAS].append({"data_referencia": "2026-11-23",
+            "status": "erro", "iniciado_em": "2026-11-25T17:16:08+00:00"})
+        estados = mod.ler_status_cargas(banco, date(2026, 11, 24))
+        self.assertEqual(estados["2026-11-23"], "erro")
+        self.assertGreater(estados.tentativas["2026-11-23"], 0)
+
+    def test_limite_menor_recupera_usuario_nao_informado(self):
+        evento = {"id": "1"}
+        outro = {"id": "2"}
+        aud = Mock()
+        aud.consultar.side_effect = [mod.ErroHTTP500Persistente("500"),
+                                     (2, [evento]), (2, [evento, outro])]
+        regs, total = mod.coletar_grupo(aud, date(2026, 11, 23),
+            [{"id": "-", "nome": "[Nao informado]"}], subdividir_http500=True)
+        self.assertEqual((regs, total), ([evento, outro], 2))
+        self.assertEqual([c.kwargs["limite"] for c in aud.consultar.call_args_list],
+                         [mod.LIMITE_REQUISICAO, 1, 2])
+
+    def test_limite_menor_nao_aceita_coleta_incompleta_ou_zero(self):
+        for respostas in [[(0, [])], [(2, [{"id": "1"}]), (2, [{"id": "1"}])],
+                          [mod.ErroHTTP500Persistente("500")]]:
+            aud = Mock()
+            aud.consultar.side_effect = [mod.ErroHTTP500Persistente("500")] + respostas
+            with self.assertRaises(mod.ErroServidorPersistente):
+                mod.coletar_grupo(aud, date(2026, 11, 23),
+                    [{"id": "-", "nome": "[Nao informado]"}], subdividir_http500=True)
+
